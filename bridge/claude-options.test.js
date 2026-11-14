@@ -1,14 +1,15 @@
 // baseQueryOptions：system prompt 追加引导 + 会话字段透传。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { baseQueryOptions, LARGE_TASK_HINT } from './agents/claude.js';
+import { baseQueryOptions, LARGE_TASK_HINT, TAB_DISCIPLINE_HINT } from './agents/claude.js';
 
-test('systemPrompt 在 preset 后追加大任务引导', () => {
+test('systemPrompt 在 preset 后追加大任务引导与标签页纪律', () => {
   const o = baseQueryOptions({ cwd: '', contextDirs: [], agentSessionId: '', permissionMode: 'bypassPermissions', model: '' });
   assert.equal(o.systemPrompt.type, 'preset');
   assert.equal(o.systemPrompt.preset, 'claude_code');
-  assert.equal(o.systemPrompt.append, LARGE_TASK_HINT);
+  assert.equal(o.systemPrompt.append, [LARGE_TASK_HINT, TAB_DISCIPLINE_HINT].join('\n\n'));
   assert.match(LARGE_TASK_HINT, /parallel Task subagents/);
+  assert.match(TAB_DISCIPLINE_HINT, /Never close the user/);
 });
 
 test('会话字段透传：cwd / 上下文目录 / 续接 / 权限模式 / 模型', () => {

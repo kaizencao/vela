@@ -145,9 +145,9 @@ bridge → 客户端，事件帧统一：
 | 增量文本 | `stream_event` → `content_block_delta`（text_delta / thinking_delta） |
 | 工具调用 | assistant 消息 `tool_use` 块 → `tool_call`；对应 `tool_result` → `tool_call_update`。消息的 `parent_tool_use_id` 透传为 `parentId`（子智能体归组），两侧时间戳差透传为 `durationMs`（每步耗时） |
 | 权限审批 | `options.canUseTool` 回调 → 发 `permission_request`、挂起等待 → 回 `{behavior:'allow'/'deny'}`；30 分钟无响应按 deny |
-| 取消 | `AbortController` → `options.abortController`；bridge 侧兜底杀子进程树（记 pid） |
+| 取消 | `AbortController` → `options.abortController`，SDK 负责杀子进程；**abort 宽限收场**：SDK 不公开 pid、杀不干净时（Windows 偶发，进程树挂着守护进程）generator 永不返回，abort 后 5s（`ABORT_GRACE_MS`）放弃等待循环、强制发 `turn_end(cancelled)` 并复位 busy，防止「上一轮还没结束」永久卡死 |
 | 权限模式 | `permissionMode`：'default' / 'acceptEdits' / 'bypassPermissions'，来自 `session.new` 参数，默认 'default' |
-| system prompt | `systemPrompt: {type:'preset', preset:'claude_code', append: LARGE_TASK_HINT}`——preset 后追加大任务引导（2–4 个并行 Task 子智能体拆分探索，替代主线程串行 Grep/Glob/Read）。SDK snapshot 语义：append 在会话首个请求固化进 transcript，旧会话 resume 不重读，只有新会话生效 |
+| system prompt | `systemPrompt: {type:'preset', preset:'claude_code', append: [LARGE_TASK_HINT, TAB_DISCIPLINE_HINT].join('\n\n')}`——preset 后追加两段引导：大任务拆分（2–4 个并行 Task 子智能体替代主线程串行 Grep/Glob/Read）与标签页纪律（agent 替用户操作网页时优先当前页导航、点开的新标签页读完即关、不批量开页、**绝不关用户的主页面**——CLI 驱动浏览器的行为协议层拦不住，只能进 prompt）。SDK snapshot 语义：append 在会话首个请求固化进 transcript，旧会话 resume 不重读，只有新会话生效 |
 | Windows | SDK 的 `pathToClaudeCodeExecutable` 指向解析后的真实入口（`where claude` 的结果，规避 `.cmd` 需 shell 展开的问题） |
 
 ### codex 适配器（`codex app-server` 映射，0.5.0 已实现）

@@ -1,7 +1,8 @@
 // claude code 适配器：包 Claude Agent SDK 的 query()。
 // 映射：stream_event 增量 → message_chunk/thought_chunk；tool_use → tool_call；
 // tool_result → tool_call_update；canUseTool → permission_request（挂起等 respond）。
-// SDK 未公开子进程 pid，取消统一走 AbortController，SDK 自己负责杀子进程。
+// SDK 未公开子进程 pid，取消统一走 AbortController，SDK 自己负责杀子进程；
+// 杀不干净时（Windows 偶发，进程树里挂着守护进程）abort 宽限超时强制收场，见 startTurn。
 
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
@@ -10,6 +11,9 @@ import { join } from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
 const PROBE_TIMEOUT_MS = 3000;
+// abort 后等 SDK 循环自行退出的宽限：超时说明 CLI 进程树没杀干净（for await 永不返回），
+// 强制按取消收场——否则 busy 永久卡 true，下一轮报「上一轮还没结束」，面板停止也收不了场
+const ABORT_GRACE_MS = 5000;
 
 // SDK 自带捆绑的 CLI；VELA_CLAUDE_PATH 可指向用户自己的安装
 export function claudeExecutablePath() {
@@ -62,6 +66,16 @@ export const LARGE_TASK_HINT = [
   'only for quick, small lookups. Parallel subagents finish faster and keep the main context small.',
 ].join(' ');
 
+// 浏览器标签页纪律。agent 替用户点网页按钮/链接时容易开出一堆新标签页不管，更不能动
+// 用户自己的主页面。CLI 驱动浏览器的行为协议层拦不住，只能进 system prompt。
+export const TAB_DISCIPLINE_HINT = [
+  'Browser-tab discipline: when operating web pages for the user, navigate the current tab',
+  'instead of opening new ones whenever possible. If a click necessarily opens a new tab,',
+  'read what you need from it and close it before moving on — do not leave stray tabs open,',
+  'and do not open many tabs at once. Never close the user\'s original or currently active tab:',
+  'it is their main page and must stay open exactly where they left it.',
+].join(' ');
+
 // query() 的静态选项（不含 abortController / canUseTool 这类每轮新建的回调）。
 // 导出给测试断言：systemPrompt 追加、cwd/model/权限模式透传。
 export function baseQueryOptions(session) {
@@ -72,9 +86,9 @@ export function baseQueryOptions(session) {
     permissionMode: session.permissionMode || 'default',
     model: session.model || undefined, // 留空用 SDK/CLI 默认模型
     includePartialMessages: true,
-    // preset 后追加引导文案。SDK 默认 snapshot: 会话首个请求把 system prompt
-    // 固化进 transcript，之后 resume 的旧会话不重读 append——只有新会话生效。
-    systemPrompt: { type: 'preset', preset: 'claude_code', append: LARGE_TASK_HINT },
+    // preset 后追加引导文案（大任务拆分 + 标签页纪律）。SDK 默认 snapshot: 会话首个请求
+    // 把 system prompt 固化进 transcript，之后 resume 的旧会话不重读 append——只有新会话生效。
+    systemPrompt: { type: 'preset', preset: 'claude_code', append: [LARGE_TASK_HINT, TAB_DISCIPLINE_HINT].join('\n\n') },
     ...(claudeExecutablePath() ? { pathToClaudeCodeExecutable: claudeExecutablePath() } : {}),
   };
 }
@@ -127,10 +141,17 @@ export const claudeAdapter = {
   },
 
   // 跑一个 turn：文本增量、思考增量、工具调用、审批、结果全部经 emit 出去。
-  // 结束保证发 turn_end；signal 已中止时 stopReason='cancelled'。
+  // 结束保证发 turn_end（含 abort 宽限超时的强制收场）；signal 已中止时 stopReason='cancelled'。
   async startTurn(session, text, { emit, signal, onPermission }) {
     const abort = new AbortController();
-    const onAbort = () => abort.abort();
+    let ended = false;
+    const endTurn = (ev) => { if (ended) return; ended = true; emit(ev); };
+    let hungResolve = null;
+    let graceTimer = 0;
+    const onAbort = () => {
+      abort.abort();
+      graceTimer = setTimeout(() => hungResolve?.({ hung: true }), ABORT_GRACE_MS);
+    };
     signal.addEventListener('abort', onAbort, { once: true });
 
     let streamed = 0;
@@ -147,8 +168,14 @@ export const claudeAdapter = {
       },
     };
 
+    const hung = new Promise((resolve) => { hungResolve = resolve; });
     try {
-      for await (const message of query({ prompt: text, options })) {
+      const it = query({ prompt: text, options })[Symbol.asyncIterator]();
+      while (true) {
+        // 逐条 race：abort 宽限超时后 hung 落定 → 放弃卡死的循环，走下方强制收场
+        const r = await Promise.race([it.next(), hung]);
+        if (!r || r.done || r.hung) break;
+        const message = r.value;
         if (signal.aborted) break;
         switch (message.type) {
           case 'system':
@@ -228,14 +255,15 @@ export const claudeAdapter = {
             break; // 未知消息类型丢弃
         }
       }
-      emit({ kind: 'turn_end', stopReason: signal.aborted ? 'cancelled' : 'end' });
+      endTurn({ kind: 'turn_end', stopReason: signal.aborted ? 'cancelled' : 'end' });
     } catch (err) {
       if (signal.aborted) {
-        emit({ kind: 'turn_end', stopReason: 'cancelled' });
+        endTurn({ kind: 'turn_end', stopReason: 'cancelled' });
       } else {
-        emit({ kind: 'turn_end', stopReason: 'error', error: err?.message || String(err) });
+        endTurn({ kind: 'turn_end', stopReason: 'error', error: err?.message || String(err) });
       }
     } finally {
+      clearTimeout(graceTimer);
       signal.removeEventListener('abort', onAbort);
     }
   },

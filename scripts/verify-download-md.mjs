@@ -58,8 +58,9 @@ try {
   const W = `document.getElementById('om-widget-host')?.shadowRoot`;
   await waitFor(() => E(`!!${W}?.querySelector('.om-ball')`), { timeout: 15000 });
   const stackOpen = () => E(`!!${W}.querySelector('.stack.open')`);
-  check('浮窗默认收起为悬浮球（动作列隐藏）',
-    !await stackOpen() && await E(`${W}.querySelector('.om-ball').getBoundingClientRect().width`) === 40);
+  // 悬浮球宽 40px：系统显示缩放下 getBoundingClientRect 带小数（实测 39.995），按容差判
+  const ballW = await E(`${W}.querySelector('.om-ball').getBoundingClientRect().width`);
+  check('浮窗默认收起为悬浮球（动作列隐藏）', !await stackOpen() && Math.abs(ballW - 40) < 0.5);
   const ball = JSON.parse(await E(`(() => {
     const r = ${W}.querySelector('.om-ball').getBoundingClientRect();
     return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2 });

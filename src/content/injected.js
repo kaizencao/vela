@@ -127,10 +127,28 @@ export function snapInteractive(maxItems) {
 
 // 按 ref 真实点击：完整鼠标事件序列（pointer/mouse down-up-click，中心点坐标，事件冒泡穿透
 // shadow 边界），比 el.click() 兼容 React 合成事件与 mousedown/mouseup 分步监听的站点。
-// 合成事件 isTrusted=false，行为检测严格的站点可能不响应——已知边界
-export function clickByRef(ref) {
+// 合成事件 isTrusted=false，行为检测严格的站点可能不响应——已知边界。
+// suppressNav=true 时拦下同页 <a> 的默认跳转：在 document 捕获层抢先 preventDefault
+//（锚点的默认动作只要事件被 preventDefault 就不发生，页面的点击监听 / 委托路由照常跑），
+// 调用方拿到 href 后就地读内容，原页面保持不动。只拦会整页跳转的 http(s) 链接（排除
+// target=_blank 与 download）；页面 JS 处理器里的跳转（location.href=）拦不住，由调用方
+// 的 tabs API 地址比对兜底告知
+export function clickByRef(ref, suppressNav) {
   const el = document.querySelector(`[data-om-ref="${ref}"]`);
   if (!el) return { ok: false, error: 'ref 已过期（页面可能已重渲染或已跳转），请重新 snapshot_interactive' };
+  let heldNav = null; // 拦下的链接绝对地址；null = 没拦（非同页链接 / 未启用拦截）
+  let onDocClick = null;
+  if (suppressNav && el.tagName === 'A' && el.getAttribute('href')) {
+    let href = '';
+    try { href = new URL(el.getAttribute('href'), location.href).href; } catch { /* 坏地址不拦 */ }
+    const target = (el.getAttribute('target') || '').toLowerCase();
+    if (/^https?:/i.test(href) && !el.hasAttribute('download')
+      && (target === '' || target === '_self' || target === '_top' || target === '_parent')) {
+      heldNav = href;
+      onDocClick = (e) => { try { if (e.target === el || el.contains(e.target)) e.preventDefault(); } catch { /* 文档销毁中 */ } };
+      document.addEventListener('click', onDocClick, { capture: true, once: true });
+    }
+  }
   try { el.scrollIntoView({ block: 'center' }); } catch { /* 已在视口外兜底直接点 */ }
   const r = el.getBoundingClientRect();
   const opts = {
@@ -142,11 +160,30 @@ export function clickByRef(ref) {
     const Ev = t.startsWith('pointer') && window.PointerEvent ? window.PointerEvent : MouseEvent;
     el.dispatchEvent(new Ev(t, opts));
   }
+  if (onDocClick) document.removeEventListener('click', onDocClick, { capture: true });
   return {
     ok: true,
     clicked: (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 60),
     url: location.href.split('#')[0],
+    heldNav,
   };
+}
+
+// 按 ref 读目标元素描述（审批卡展示用）：只读不点，让用户看清即将点到的是什么。
+// 返回 ok:false = ref 已找不到对应元素（页面重渲染 / 新快照已重新编号）
+export function describeByRef(ref) {
+  const el = document.querySelector(`[data-om-ref="${ref}"]`);
+  if (!el) return { ok: false };
+  const tag = el.tagName.toLowerCase();
+  const text = (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  const aria = String(el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  const value = tag === 'input' || tag === 'textarea' ? String(el.value || '').slice(0, 60) : '';
+  let href = '';
+  if (tag === 'a' && el.getAttribute('href')) {
+    try { href = new URL(el.getAttribute('href'), location.href).href; } catch { /* 坏地址留空 */ }
+  }
+  const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true' || el.classList.contains('disabled');
+  return { ok: true, tag, role: el.getAttribute('role') || '', text, aria, value, href, disabled };
 }
 
 // 等待信号：文本子串 / 选择器出现（或 gone=true 时消失），无信号参数就是纯延时。
@@ -263,6 +300,32 @@ export function clickRecipeNext(clickSel) {
     el.dispatchEvent(new Ev(t, opts));
   }
   return { ok: true };
+}
+
+// 审批卡预览配方会点到的元素（只读不点）：列表匹配数、首个列表项的点击目标与「下一页」控件。
+// 与 listRecipeItems 同款不做可见性过滤——预览和实际执行看到的是同一批元素，数字才对得上
+export function describeRecipe(itemsSel, scopeSel, clickSel, nextSel) {
+  const desc = (el) => {
+    if (!el) return '';
+    const tag = el.tagName.toLowerCase();
+    const text = (el.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    return `<${tag}>「${text || el.getAttribute('aria-label') || el.getAttribute('title') || '（无文本）'}」`;
+  };
+  let root = document;
+  if (scopeSel) {
+    root = document.querySelector(scopeSel);
+    if (!root) return { error: `容器选择器没匹配到元素：${scopeSel}` };
+  }
+  let els;
+  try { els = [...root.querySelectorAll(itemsSel)]; } catch { return { error: `选择器语法错误：${itemsSel}` }; }
+  const first = clickSel ? els[0]?.querySelector(clickSel) : els[0];
+  const nx = nextSel ? document.querySelector(nextSel) : null;
+  return {
+    count: els.length,
+    first: desc(first),
+    next: nx ? desc(nx) : '',
+    nextDisabled: !!(nx && (nx.disabled || nx.getAttribute('aria-disabled') === 'true' || nx.classList.contains('disabled'))),
+  };
 }
 
 // ---------- 整页转 Markdown（下载网页为 .md 用） ----------

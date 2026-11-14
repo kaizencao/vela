@@ -1530,6 +1530,19 @@ export async function createChatView() {
     return pre;
   }
 
+  // 纯文本详情（点击类工具的目标元素描述）：逐行 div 渲染（textContent 赋值，防注入），
+  // 不做 diff 着色——页面元素文本什么字符都可能带，「+ 关注」会被误染成新增行
+  function plainDetailEl(text) {
+    const pre = document.createElement('pre');
+    pre.className = 'om-diff';
+    for (const line of String(text).split('\n')) {
+      const row = document.createElement('div');
+      row.textContent = line || ' ';
+      pre.appendChild(row);
+    }
+    return pre;
+  }
+
   // LLM 任务模式的工具审批卡：挂在本轮回答的步骤区下方，Promise 落定为允许/拒绝。
   // 勾「本对话不再询问」后同一工具在本对话（本页面存活期间）自动放行；停止本轮即按拒绝收场
   const toolAllow = new Map(); // convId -> Set<toolName>
@@ -1544,13 +1557,14 @@ export async function createChatView() {
       const detail = document.createElement('div');
       detail.className = 'om-perm-detail';
       detail.textContent = JSON.stringify(args, null, 2).slice(0, 1200);
-      // 写文件类工具：卡片换成修改前后的 diff（异步算好后替换参数 JSON）
+      // 写文件类工具换修改前后 diff（+/- 着色）；点击类工具换目标元素的纯文本描述
+      //（异步算好后替换默认的参数 JSON）
       if (tool.approvalDetail) {
-        detail.textContent = '正在计算修改内容…';
+        detail.textContent = '正在读取详情…';
         Promise.resolve(tool.approvalDetail(args)).then((d) => {
           title.textContent = `请求执行：${d.title}`;
-          detail.replaceChildren(diffEl(d.diff || '（无改动）'));
-        }).catch((e) => { detail.textContent = `无法预览修改：${e.message}（允许后执行多半也会失败）`; });
+          detail.replaceChildren(d.diff != null ? diffEl(d.diff || '（无改动）') : plainDetailEl(d.detail || '（无详情）'));
+        }).catch((e) => { detail.textContent = `无法生成预览：${e.message}（允许后执行多半也会失败）`; });
       }
       const always = document.createElement('label');
       always.className = 'om-perm-always';

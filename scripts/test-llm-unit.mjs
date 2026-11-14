@@ -26,6 +26,7 @@ const { anthropicAdapter, toAnthropicMessages } = await import('../src/llm/anthr
 const { streamChat } = await import('../src/llm/store.js');
 const { consumeSse } = await import('../src/llm/sse.js');
 const { runToolLoop, validateArgs, repairToolTrail } = await import('../src/llm/tool-loop.js');
+const { validateExtractRecipe, EXTRACT_CAPS } = await import('../src/llm/browser-tools.js');
 
 const mock = await startMockLlm({
   respond: (req) => {
@@ -377,6 +378,79 @@ test('修复后的轨迹转 OpenAI wire 格式：每个 tool_calls 都有紧跟�
     }
     assert.equal(need.size, 0, `id ${[...need]} 没有工具响应消息`);
   }
+});
+
+// ---- PDF 标签页管线：入口判断 / 文件名提取（纯函数） ----
+const { isPdfUrl, pdfNameFromUrl } = await import('../src/page/pdf-doc.js');
+
+test('isPdfUrl：后缀/协议/大小写/边界', () => {
+  assert.equal(isPdfUrl('https://x.com/a/b.pdf'), true);
+  assert.equal(isPdfUrl('https://x.com/a/b.PDF?dl=1'), true);
+  assert.equal(isPdfUrl('file:///D:/docs/report.pdf'), true);
+  assert.equal(isPdfUrl('https://x.com/a.pdf#page=3'), true);
+  assert.equal(isPdfUrl('https://x.com/download?file=a.pdf'), false); // 无后缀动态链路：识别不了，接受的取舍
+  assert.equal(isPdfUrl('https://x.com/'), false);
+  assert.equal(isPdfUrl('chrome-extension://abc/page.html'), false);
+  assert.equal(isPdfUrl(''), false);
+  assert.equal(isPdfUrl('not a url'), false);
+});
+
+test('pdfNameFromUrl：取末段/解码/容错', () => {
+  assert.equal(pdfNameFromUrl('https://x.com/dir/my%20deck.pdf'), 'my deck.pdf');
+  assert.equal(pdfNameFromUrl('https://x.com/a.pdf?dl=1'), 'a.pdf');
+  assert.equal(pdfNameFromUrl('file:///D:/docs/%E6%8A%A5%E5%91%8A.pdf'), '报告.pdf');
+  assert.equal(pdfNameFromUrl('https://x.com/notpdf'), '');
+  assert.equal(pdfNameFromUrl('https://x.com/'), '');
+  assert.equal(pdfNameFromUrl('https://x.com/%E7%A0%B4%E8%AF%AD%E6%B3%95%FF.pdf'), ''); // 坏编码不抛错
+  assert.equal(pdfNameFromUrl(''), '');
+});
+
+test('isPdfUrl 与 pdfNameFromUrl 对同一输入的判定一致', () => {
+  for (const u of ['https://x/a.pdf', 'https://x/a.PDF?q=1', 'file:///d/x.pdf', 'https://x/b.mobi', '']) {
+    assert.equal(isPdfUrl(u), !!pdfNameFromUrl(u));
+  }
+});
+
+test('validateExtractRecipe：合法配方放行', () => {
+  const ok = {
+    items: 'ul#list > li',
+    scope: '#main',
+    click: 'button.more',
+    waitSelector: '.detail:not(:empty)',
+    waitMs: 800,
+    fields: [
+      { name: '标题', selector: 'h3', attr: '' },
+      { name: '链接', selector: 'a', attr: 'href' },
+    ],
+    rel: 'item',
+    itemLimit: 5,
+    intervalMs: 200,
+    next: { click: 'a.next', waitMs: 300, maxPages: 3 },
+  };
+  assert.equal(validateExtractRecipe(ok), '');
+  assert.equal(validateExtractRecipe({ items: '.row', fields: [{ name: 'x', selector: '.x' }] }), '');
+});
+
+test('validateExtractRecipe：缺项与类型错各就各位报错', () => {
+  assert.match(validateExtractRecipe(null), /JSON 对象/);
+  assert.match(validateExtractRecipe([]), /JSON 对象/);
+  assert.match(validateExtractRecipe({ fields: [{ name: 'x', selector: '.x' }] }), /items/);
+  assert.match(validateExtractRecipe({ items: '.row' }), /fields/);
+  assert.match(validateExtractRecipe({ items: '.row', fields: '标题' }), /fields/);
+  assert.match(validateExtractRecipe({ items: '.row', fields: [{ selector: '.x' }] }), /name/);
+  assert.match(validateExtractRecipe({ items: '.row', fields: [{ name: 'x' }] }), /selector/);
+  assert.match(validateExtractRecipe({ items: '.row', fields: [{ name: 'x', selector: '.x' }], rel: 'both' }), /rel/);
+  assert.match(validateExtractRecipe({ items: '.row', fields: [{ name: 'x', selector: '.x' }], next: {} }), /next.click/);
+  assert.match(validateExtractRecipe({ items: '.row', fields: [{ name: 'x', selector: '.x' }], itemLimit: 0 }), /itemLimit/);
+});
+
+test('validateExtractRecipe：上限收紧（选择器长度 / 字段数）', () => {
+  const long = '.'.repeat(EXTRACT_CAPS.selectorMax + 1);
+  assert.match(validateExtractRecipe({ items: long, fields: [{ name: 'x', selector: '.x' }] }), /items/);
+  assert.match(validateExtractRecipe({ items: '.row', fields: [{ name: 'x', selector: long }] }), /selector/);
+  const many = Array.from({ length: EXTRACT_CAPS.maxFields + 1 }, (_, i) => ({ name: `f${i}`, selector: '.x' }));
+  assert.match(validateExtractRecipe({ items: '.row', fields: many }), /fields 最多/);
+  assert.match(validateExtractRecipe({ items: '.row', fields: [{ name: 'x', selector: '.x' }], next: { click: 'a', maxPages: 0 } }), /maxPages/);
 });
 
 test.after(() => mock.close());

@@ -1,0 +1,5 @@
+<!doctype html>
+<!-- 离屏文档：SW 不能 URL.createObjectURL，网页 Markdown 的 blob 下载经这里中转（chrome.offscreen 标准用法）。
+     生命周期由 SW 管理（ensureOffscreen / 空闲关闭），本文档只被动接消息干活。 -->
+<title>Vela 下载中转</title>
+<script type="module" src="offscreen.js"></script>

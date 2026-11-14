@@ -55,6 +55,7 @@ const SUITES = [
   ['划词思维导图 e2e（mock LLM）', ['scripts/verify-mindmap.mjs']],
   ['网页媒体悬停 e2e（mock LLM）', ['scripts/verify-media.mjs']],
   ['连续阅读（跟随下一页）e2e（mock LLM）', ['scripts/verify-read-series.mjs']],
+  ['下载网页为 Markdown e2e', ['scripts/verify-download-md.mjs']],
   ['知识库同步到 Agent 工作区（bridge）', ['scripts/verify-kb-agent-sync.mjs'], { bridge: true }],
   ['卡片里 LLM 任务经 bridge 读写本机路径（bridge）', ['scripts/verify-kb-bridge.mjs'], { bridge: true }],
   ['会话导出（bridge）', ['scripts/verify-export.mjs'], { bridge: true }],

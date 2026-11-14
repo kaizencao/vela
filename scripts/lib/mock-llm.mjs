@@ -116,6 +116,9 @@ export async function startMockLlm({ port = 0, respond } = {}) {
     const protocol = kind === 'messages' ? 'anthropic' : 'openai';
     const n = normalizeRequest(protocol, prefix, body);
     n.headers = req.headers;
+    // 客户端中途断开（页签关闭中止 fetch / 停止按钮 abort）：SSE 没写完就 close，记在请求上
+    n.aborted = false;
+    res.on('close', () => { if (!res.writableEnded) n.aborted = true; });
     requests.push(n);
     let spec;
     try { spec = (await respond?.(n, requests)) ?? { text: 'mock 默认回答' }; } catch (e) { spec = { error: { status: 500, body: String(e) } }; }

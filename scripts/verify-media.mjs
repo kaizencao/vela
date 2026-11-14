@@ -82,8 +82,10 @@ document.addEventListener('mouseover', (ev) => {
   });
   if (window.__omHovers.length > 40) window.__omHovers.shift();
 });
-// 录一段三阶段文字的 webm（MediaRecorder），blob URL 挂到 v1——流式视频的真实形态
-(function () {
+// 录一段三阶段文字的 webm（MediaRecorder），blob URL 挂到 v1——流式视频的真实形态。
+// 录制前先等合成器出画：窗口未显示 / 被遮挡时 canvas 不重绘，captureStream 收不到帧，
+// 会录出无帧空壳 webm（回放直接 NotSupportedError）——rAF 只在真正出画时触发，拿它当闸门
+(async function () {
   const c = document.createElement('canvas'); c.width = 320; c.height = 180;
   const x = c.getContext('2d');
   const phases = ['FRAME-A', 'FRAME-B', 'FRAME-C'];
@@ -104,6 +106,8 @@ document.addEventListener('mouseover', (ev) => {
     v.play().then(() => setTimeout(() => v.pause(), 400));
     window.__omVidReady = true;
   };
+  for (let w = 0; w < 50 && document.visibilityState !== 'visible'; w++) await new Promise((r) => setTimeout(r, 100));
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
   const tick = setInterval(draw, 700);
   rec.start();
   setTimeout(() => { clearInterval(tick); rec.stop(); }, 2100);
@@ -111,7 +115,7 @@ document.addEventListener('mouseover', (ev) => {
 // 真 MSE 流（bilibili 同形态）：录好的 webm 经 MediaSource + SourceBuffer 喂给 v3。
 // v1 的 blob: 指向完整文件，v3 的 blob: 指向 MediaSource——seek 依赖缓冲数据、
 // 定位后新帧要等解码完成 requestVideoFrameCallback 才上屏，截帧路径与真实流式站一致
-(function () {
+(async function () {
   const c = document.createElement('canvas'); c.width = 320; c.height = 180;
   const x = c.getContext('2d');
   const phases = ['MSE-A', 'MSE-B', 'MSE-C'];
@@ -141,6 +145,9 @@ document.addEventListener('mouseover', (ev) => {
       new Blob(parts).arrayBuffer().then((ab) => sb.appendBuffer(ab));
     }, { once: true });
   };
+  // 与 v1 同款出画闸门：窗口没出画就开录会得到空壳 webm，MSE appendBuffer 后照样开不了 demuxer
+  for (let w = 0; w < 50 && document.visibilityState !== 'visible'; w++) await new Promise((r) => setTimeout(r, 100));
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
   const tick = setInterval(draw, 700);
   rec.start();
   setTimeout(() => { clearInterval(tick); rec.stop(); }, 2100);
@@ -220,7 +227,9 @@ try {
   };
   await waitFor(() => page.evaluate(`!!document.getElementById('om-widget-host')`));
   await waitFor(() => page.evaluate(`window.__omVidReady === true && document.getElementById('v1').videoWidth > 0`), { timeout: 15000 });
-
+  // waitFor 超时不抛错：解码失败必须在这里显式报红，否则测试带着坏 fixture 跑到底、
+  // 截帧用例全报「还没有画面数据」，根因被淹掉
+  check('fixture：v1 的录制 webm 解码成功', await page.evaluate(`window.__omVidReady === true && document.getElementById('v1').videoWidth > 0`));
   // ---- 大面板入口已移除：浮窗动作列没有媒体钮，悬停是唯一入口 ----
   const acts = await page.evaluate(`[...document.getElementById('om-widget-host').shadowRoot.querySelectorAll('button[data-act]')].map((b) => b.dataset.act)`);
   check('浮窗动作列无媒体大面板钮（悬停为唯一入口）', !acts.includes('media'), acts);
@@ -421,6 +430,7 @@ try {
 
   // ---- 真 MSE 流（v3）：bilibili 同形态 —— src 精确定位 + 等新帧上屏后截帧 ----
   await waitFor(() => page.evaluate(`window.__omMseReady === true && document.getElementById('v3').videoWidth > 0`), { timeout: 15000 });
+  check('fixture：v3 的 MSE 流有画面', await page.evaluate(`window.__omMseReady === true && document.getElementById('v3').videoWidth > 0`));
   // 先撤走 v1：页面只剩解不出画面的 v2（假 mp4）与 v3——分析若成功，只可能精确命中 v3
   page.evaluate(`document.getElementById('v1').remove()`);
   const rectV3 = await page.evaluate(`(() => { const v = document.getElementById('v3'); v.scrollIntoView({ block: 'center' }); const r = v.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; })()`);

@@ -44,7 +44,8 @@
     + 'figcaption, dd, dt, label';
   // 子树含这些元素 → 整块跳过。不含 <a>/<code>/<kbd>/<samp>：文档站标题内嵌锚点链接、
   // 正文/表格单元格混行内代码（选项名、参数值）都是正常可译内容，行内代码由 prompt 保持原样；
-  // 代码块已由 pre 覆盖；沉浸模式整块替换为纯译文，行内标记按 innerHTML 快照在还原时恢复。
+  // pre 自身在 SKIP_TAGS、pre 内部节点由 candidateText 的 closest('pre') 拒收（代码块整体不译）；
+  // 沉浸模式整块替换为纯译文，行内标记按 innerHTML 快照在还原时恢复。
   // 不含 <svg>：图标（导航链接的 chevron、按钮里的图形）innerText 无文本，不是拒收理由——
   // 含图标的链接一旦被拒，顶栏导航整排都进不了翻译。
   const SKIP_TAGS = new Set([
@@ -63,6 +64,10 @@
     if (node.getAttribute('data-om-tx') != null) return null; // 已收录
     if (node.closest('.om-tx-dst')) return null; // 自己插入的译文节点不收录，防重复翻译
     if (SKIP_TAGS.has(node.tagName.toLowerCase())) return null;
+    // 代码块内部整体不译：语法高亮（Pygments/highlight.js）把每行拆成逐 token 的 span，
+    // 第二遍兜底扫描只查自身与子树、不看祖先，pre 里的 span 会逐个收录——「翻译中」标记
+    // 逐行打进代码块、伪译文回填破坏代码展示（Flink 文档 SQL 块实报）。行内 <code> 不受影响。
+    if (node.closest('pre')) return null;
     // 标题豁免：手风琴问题头（WAI-ARIA 标准模式 h3 > button > span 问题文本 + svg 加号）
     // 会被子树检查整块拒掉，FAQ 问题永远进不了翻译；h1-h6 容许内嵌 button
     const lax = /^h[1-6]$/i.test(node.tagName);

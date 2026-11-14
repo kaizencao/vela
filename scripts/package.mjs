@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, writeFileSync, mkdirSync, statSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildZip } from './lib/zip.mjs';
+import { buildZip, verifyZip } from './lib/zip.mjs';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const manifest = JSON.parse(readFileSync(join(ROOT, 'manifest.json'), 'utf8'));
@@ -37,6 +37,8 @@ if (!files.some((f) => f.endsWith('manifest.json'))) throw new Error('manifest.j
 
 if (!existsSync(OUT_DIR)) mkdirSync(OUT_DIR, { recursive: true });
 const zip = buildZip(files, ROOT);
+const problems = verifyZip(zip);
+if (problems.length) throw new Error(`产物自检未过，不落盘：\n${problems.join('\n')}`);
 writeFileSync(OUT, zip);
 
 const sha256 = createHash('sha256').update(zip).digest('hex');

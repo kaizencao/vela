@@ -69,13 +69,23 @@ try {
   await page.send('Page.bringToFront');
   sw.close();
 
-  // ---- 场景A：浮窗「连读」真实点击（完整链路） ----
+  // ---- 场景A：浮窗「连读」真实点击（完整链路）。浮窗默认收起为悬浮球，先真实悬停展开 ----
+  const W = `document.getElementById('om-widget-host')?.shadowRoot`;
+  const ball = JSON.parse(await waitFor(() => page.evaluate(`(() => {
+    const el = ${W}?.querySelector('.om-ball');
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2 });
+  })()`), { timeout: 15000 }));
+  check('浮窗默认收起为悬浮球（动作列隐藏）',
+    !await page.evaluate(`!!${W}.querySelector('.stack.open')`) && !!await page.evaluate(`!!${W}.querySelector('.om-ball')`));
+  await page.mouse('mouseMoved', ball.x, ball.y);
+  await waitFor(() => page.evaluate(`!!${W}?.querySelector('.stack.open')`), { timeout: 5000 });
   const btn = JSON.parse(await waitFor(() => page.evaluate(`(() => {
-    for (const h of [...document.querySelectorAll('div')].filter((d) => d.shadowRoot)) {
-      const el = h.shadowRoot.querySelector('[data-act="read-series"]');
-      if (el) { const r = el.getBoundingClientRect(); return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2, t: el.title }); }
-    }
-    return null;
+    const el = ${W}.querySelector('[data-act="read-series"]');
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2, t: el.title });
   })()`), { timeout: 15000 }));
   check('浮窗有「连读」钮（title 说明用途）', /连续阅读/.test(btn.t), btn.t);
   await page.click(btn.x, btn.y);

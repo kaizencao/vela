@@ -10,8 +10,9 @@ import {
 } from '../storage/conversations.js';
 import { buildShell, showToast, ICONS } from './shell.js';
 import { summarizeCurrentTab, translateCurrentTab, cancelTranslate, readSeriesFirstPage } from '../page/page-actions.js';
-import { buildSeriesPagePrompt, buildSeriesDigestPrompt } from '../llm/tasks.js';
+import { buildSeriesPagePrompt, buildSeriesDigestPrompt, buildPdfSummaryPrompt, buildPdfTranslatePrompt, buildPdfAgentPrompt } from '../llm/tasks.js';
 import { SERIES_MAX_PAGES, SERIES_DELAY_MS, normalizeUrl, pickNextLink, fetchSeriesPage } from '../read/series.js';
+import { fetchPdfDocument, pdfNameFromUrl, PDF_QA_MAX_FILES, PDF_QA_MAX_TOTAL_BYTES } from '../page/pdf-doc.js';
 import { getAgentClient } from '../agent/client.js';
 import { buildAgentPrompt, buildConversationMarkdown, knowledgeLocalDirs } from '../agent/compose.js';
 import { createTurnState, applyEvent, markRendered, turnStateToMeta, stateFromMeta } from '../agent/render.js';
@@ -19,7 +20,7 @@ import { runToolLoop, repairToolTrail } from '../llm/tool-loop.js';
 import { BROWSER_TOOLS, TOOLS_SYSTEM_PROMPT } from '../llm/browser-tools.js';
 import { createFsTools, discoverSkills, fsSystemPrompt } from '../llm/fs-tools.js';
 import { putHandle, putSnapshot, deleteHandle, loadRoots, ensurePermission } from '../kb/store.js';
-import { readFileHandle } from '../kb/files.js';
+import { readFileHandle, LIMITS, fmtSize } from '../kb/files.js';
 import { syncRootsToWorkspace } from '../kb/sync.js';
 import { loadBridgeRoots } from '../kb/bridge-fs.js';
 import { installCtxGuard } from '../util/ctx-guard.js';
@@ -87,12 +88,29 @@ export async function createChatView() {
   R.kbBtn.appendChild(kbBadge);
 
   let conversations = await loadConversations();
-  // 初始会话：聊天卡带 ?conv=<id>（宿主 widget 按标签页记的上次会话）则恢复它，
-  // 否则恢复最近活跃的会话（最后一条消息时间从新到旧），对齐 Monica 的打开即续聊
+  // 初始会话（聊天卡按宿主页绑定）：?conv=<id>（本标签页手动选择记忆）优先；其次 ?page=
+  // 匹配该页自己的会话（pageKey 字段优先，老会话按 pageCtx.url 推导认领——零迁移）。
+  // 都没有时不再回退「全局最近活跃」——那会把 A 页的会话串到 B 页的卡里；改为标记
+  // cardNew，在文件尾的初始会话块创建绑本页的会话（那里 newConv 依赖的模块常量才就绪，
+  // 此处直接建会 ReferenceError）。顶层视图（侧边栏 / 聊天页）与缺 ?page 的卡
+  // （旧版缓存 widget 开的）保持旧回退。pt 是 widget 顺带传来的页面标题，用作新会话标题
   let currentId = '';
-  const wantedConv = window.parent !== window ? new URLSearchParams(location.search).get('conv') : '';
-  if (wantedConv && conversations.some((c) => c.id === wantedConv)) currentId = wantedConv;
-  if (!currentId) currentId = conversations.slice().sort((a, b) => lastActive(b) - lastActive(a))[0]?.id ?? '';
+  let cardNew = null; // { pageKey, title }：卡按页新建会话的参数（初始会话块消费）
+  const isCard = window.parent !== window;
+  const cardParams = isCard ? new URLSearchParams(location.search) : null;
+  const wantedConv = cardParams?.get('conv') || '';
+  const cardPageKey = cardParams?.get('page') ? pageKey(cardParams.get('page')) : '';
+  if (wantedConv) {
+    // 页绑定约束记忆：记忆会话属于别的页时不恢复（?conv 走 sessionStorage 跨导航存活，
+    // 无条件优先会让 A 页的会话跟到 B 页——正是页绑定要拦的串会话；随后 reconcileHostCtx
+    // 还会按绑定把它拽走换新建，卡闪空）。记忆只在本页内生效（同页多会话续聊），或会话无绑定
+    const w = conversations.find((c) => c.id === wantedConv);
+    if (w && (!cardPageKey || !w.pageKey || w.pageKey === cardPageKey)) currentId = w.id;
+  }
+  if (!currentId && cardPageKey) currentId = conversations.find((c) => c.pageKey === cardPageKey
+    || (c.pageCtx && pageKey(c.pageCtx.url) === cardPageKey))?.id ?? '';
+  if (!currentId && cardPageKey) cardNew = { pageKey: cardPageKey, title: (cardParams.get('pt') || '').trim() || '新对话' };
+  if (!currentId && !cardNew) currentId = conversations.slice().sort((a, b) => lastActive(b) - lastActive(a))[0]?.id ?? '';
   let streaming = null; // {kind:'llm', abort, flushNow, persistStopped} | {kind:'agent', sessionId}
   // agent 轮运行中用户仍可发消息：入队（userItem 已落盘，关页不丢），本轮结束自动逐条发出
   const agentQueue = [];
@@ -102,6 +120,7 @@ export async function createChatView() {
 
   // ---- agent 引擎：bridge 客户端（每页单例） + 当前 turn + 探测缓存 ----
   let agentTurn = null; // {sessionId, state, answer, conv, done, lastSeq, liveEl, interrupt}
+  let agentLastEventAt = 0; // 最近一帧 agent 事件（含流式增量）的到达时刻，卡死提示用它
   let turnLossTimer = 0; // 断线宽限定时器：超时未重连则本地收尾当前 agent 轮
   let agentsCache = [];
   let agentsCacheAt = 0;
@@ -112,11 +131,24 @@ export async function createChatView() {
 
   // 会话字段小改：内存与存储同改，并把存储侧刷新的 updatedAt 同步回内存。
   // 只写存储会让多视图同步（storage.onChanged 200ms 防抖、内容比对）判定为外部改动而
-  // 整表重载内存——若恰逢一次发送正在进行，进行中的会话对象被换掉，刚发的消息随即丢失
+  // 整表重载内存——若恰逢一次发送正在进行，进行中的会话对象被换掉，刚发的消息随即丢失。
+  // patchPending 期间多视图同步不让位（见 storage.onChanged），否则同步读到旧存储把 patch 回滚
+  let patchPending = 0;
   async function patchConversation(conv, fn) {
     fn(conv);
-    const saved = await updateConversation(conv.id, fn);
-    if (saved) conv.updatedAt = saved.updatedAt;
+    patchPending += 1;
+    try {
+      let saved = await updateConversation(conv.id, fn);
+      if (!saved) {
+        // 存储里还没有这个会话：init 建初始会话的写盘可能还在途（打开页面立刻改引擎 / 选模型即撞上）。
+        // 稍候重试一次；仍未命中（多半已被别处删除）就放弃，交由同步流程以存储为准
+        await new Promise((r) => setTimeout(r, 250));
+        saved = await updateConversation(conv.id, fn);
+      }
+      if (saved) conv.updatedAt = saved.updatedAt;
+    } finally {
+      patchPending -= 1;
+    }
   }
 
   function currentEngine() {
@@ -290,13 +322,14 @@ export async function createChatView() {
     R.model.style.display = engine === 'llm' ? '' : 'none';
     R.agentSelect.style.display = engine === 'agent' ? '' : 'none';
     if (engine === 'llm') syncLlmModelSelect(conv);
+    // 权限档对两引擎生效：agent 每轮传 bridge，LLM 任务在工具审批闸门里判；
+    // LLM 问答不调工具，下拉隐藏
+    R.permSelect.style.display = (engine === 'agent' || (engine === 'llm' && conv?.llmMode === 'tools')) ? '' : 'none';
+    R.permSelect.value = conv?.permissionMode || permDefault;
     if (engine === 'agent') {
-      R.permSelect.style.display = '';
-      R.permSelect.value = conv?.permissionMode || permDefault;
       R.agentModel.style.display = '';
       syncAgentModelOptions(conv);
     } else {
-      R.permSelect.style.display = 'none';
       R.agentModel.style.display = 'none';
     }
     const kbCount = conv?.knowledge?.length || 0;
@@ -311,8 +344,9 @@ export async function createChatView() {
     renderMessages();
   }
 
-  // 引擎切换（会话级）：空会话原地换；已有消息的会话不改写历史引擎——agent 会话绑着
-  // SDK 会话 id 与工作区，混用会串上下文——改为新建一个该引擎的对话。所选值记为新会话默认
+  // 引擎切换（会话级）：一律原地换——历史原样保留，后续轮次按新引擎走。agent 的记忆在
+  // SDK 会话里（resume 只接自己的轮次），LLM 每轮全量带历史，两引擎互不读对方轮次，混排不串上下文。
+  // 所选值记为新会话默认
   R.engine.addEventListener('change', async () => {
     const key = R.engine.value;
     if (streaming || translating) {
@@ -327,17 +361,14 @@ export async function createChatView() {
     }
     defaultEngine = key;
     loadSettings().then((s) => saveSettings({ ...s, chat: { ...s.chat, defaultEngine: key } })).catch(() => {});
-    let conv = conversations.find((c) => c.id === currentId);
-    if (conv && !conv.items.length) {
-      applyEngineKey(conv, key);
-    } else {
-      conv = newConv('新对话');
-      attachPageCtx(conv);
-      conversations.unshift(conv);
-      currentId = conv.id;
-      showToast(R.toast, `已新建「${ENGINE_LABELS[key]}」对话`);
+    const conv = conversations.find((c) => c.id === currentId);
+    if (conv) {
+      const switched = conv.items.length > 0 && engineKey(conv) !== key;
+      applyEngineKey(conv, key); // 内存立即生效（发送路径同步读内存）
+      // 存储副本同改：patchConversation 的 fn 会原样落盘副本，传空函数等于把旧引擎写回去
+      await patchConversation(conv, (c) => applyEngineKey(c, key));
+      if (switched) showToast(R.toast, `已切换为「${ENGINE_LABELS[key]}」，本对话后续消息按新引擎处理`);
     }
-    await saveConversations(conversations);
     renderConvList();
     syncEngineUi();
     R.input.focus();
@@ -357,7 +388,9 @@ export async function createChatView() {
     if (!conv) return;
     const v = R.permSelect.value;
     await patchConversation(conv, (c) => { c.permissionMode = v; });
-    showToast(R.toast, `权限模式：${PERM_LABELS[v] || v}（下一轮生效）`);
+    showToast(R.toast, v === 'bypassPermissions'
+      ? `权限模式：${PERM_LABELS[v] || v}（后续工具调用不再弹审批）`
+      : `权限模式：${PERM_LABELS[v] || v}（下一轮生效）`);
   });
 
   // 会话级 agent 模型：空=用设置页默认；写回会话记录，下一轮生效
@@ -385,6 +418,7 @@ export async function createChatView() {
   function handleAgentEvent(frame) {
     if (!agentTurn || frame.sessionId !== agentTurn.sessionId) return;
     agentTurn.lastSeq = frame.seq;
+    agentLastEventAt = Date.now();
     applyEvent(agentTurn.state, frame.event);
     // 审批卡在消息流里，滚出视口就看不见——30 分钟无人应答按拒绝收场，
     // 看起来就是「卡死」。toast 提醒用户去看审批卡
@@ -641,7 +675,7 @@ export async function createChatView() {
   function chipEl(meta) {
     const chip = document.createElement('div');
     chip.className = 'om-chip';
-    chip.appendChild(svgIcon(meta.kind === 'page-summary' ? 'doc' : 'globe', 13));
+    chip.appendChild(svgIcon(meta.kind === 'page-summary' || meta.kind === 'pdf-doc' ? 'doc' : 'globe', 13));
     const a = document.createElement('a');
     a.href = meta.url || '#';
     a.target = '_blank';
@@ -1120,9 +1154,11 @@ export async function createChatView() {
   // 存储写入串行化 + 节流：增量期间 500ms 一写（内存 localContent 是权威值），
   // 结束/停止/出错强制落盘。并发 updateConversation 会互相覆盖丢字，必须排队。
   // sel = { providerId, model }：随会话记住，发送时精确路由到该供应商。
+  // opts.temperature：调用级覆盖（PDF 翻译要 0），透传 streamChat overrides。
   // 会话 llmMode='tools' 时走任务模式：工具循环（tool-loop.js）+ 浏览器工具，步骤与 agent 同款渲染。
-  async function runAssistantTurn(conv, userItem, sel) {
+  async function runAssistantTurn(conv, userItem, sel, opts = {}) {
     const toolsMode = conv.llmMode === 'tools';
+    let permMode = 'default'; // 任务轮生效权限档：toolsMode 分支里每轮读（bypass/acceptEdits 贯通工具审批）
     // 任务轮的正文只是展示层（各段文本拼起来的渲染稿）：真实上下文是持久化的消息轨迹
     // （工具调用 + 工具结果 + 各段正文）。回传轨迹而不是纯文本，「继续」与追问才能带着
     // 已做过的工具结果接着做——否则模型看不到自己做过什么，整个任务从零重来，步数永远不够
@@ -1152,11 +1188,20 @@ export async function createChatView() {
       // 已开着的聊天窗仍会按 12 中止任务（storage.onChanged 不监听 llmSettings）
       const settings = await loadSettings();
       toolMaxSteps = Number(settings.chat?.toolMaxSteps) || 12;
+      // 生效权限档与 agent 引擎同公式（会话覆盖 > 设置页默认），approve 闸门里判；
+      // 每轮读当前值，设置页改默认档对已开会话的下一轮生效
+      permMode = conv.permissionMode || settings.agentBridge?.permissionMode || 'default';
       history.unshift({ role: 'system', content: [TOOLS_SYSTEM_PROMPT, fsSystemPrompt(roots, skills), settings.defaults?.systemPrompt].filter(Boolean).join('\n\n') });
     } else {
-      // 问答模式不调工具：知识库里授权的单个文件直接附进上下文（文件夹需 LLM 任务按需读取）
-      const kbText = await llmKbContext(conv);
-      if (kbText) history.unshift({ role: 'system', content: kbText });
+      // 问答模式不调工具：知识库文本读成 system 上下文；PDF 转附件挂在最近一条 user 消息上
+      //（不能挂 system——anthropic 适配器会整体丢弃 system 消息，附件只能随 user 走）。
+      // 每轮重读重挂：字节在知识库快照 / 句柄里持久存在，追问自动带上
+      const kb = await llmKbContext(conv);
+      if (kb.text) history.unshift({ role: 'system', content: kb.text });
+      if (kb.attachments?.length) {
+        const lastUser = [...history].reverse().find((m) => m.role === 'user');
+        if (lastUser) lastUser.attachments = kb.attachments;
+      }
     }
 
     conv.llmProviderId = sel.providerId;
@@ -1280,7 +1325,13 @@ export async function createChatView() {
             });
             return out;
           },
-          approve: (req) => askToolApproval(conv.id, answer.id, req, abort.signal),
+          approve: (req) => {
+            // 权限档贯通 LLM 任务：自动放行不再弹审批卡（浏览器副作用工具与 fs 写工具一体）；
+            // 自动接受编辑只放行文件写入，与 agent 引擎的 acceptEdits 语义对齐
+            if (permMode === 'bypassPermissions') return Promise.resolve(true);
+            if (permMode === 'acceptEdits' && (req.tool === 'write_file' || req.tool === 'edit_file')) return Promise.resolve(true);
+            return askToolApproval(conv.id, answer.id, req, abort.signal);
+          },
           onEvent: (e) => {
             applyEvent(toolState, e);
             localContent = toolState.content;
@@ -1313,6 +1364,7 @@ export async function createChatView() {
           messages: history,
           model: sel.model,
           providerId: sel.providerId,
+          overrides: opts.temperature != null ? { temperature: opts.temperature } : undefined,
           signal: abort.signal,
           onDelta: (d) => {
             if (d.error) {
@@ -1341,7 +1393,12 @@ export async function createChatView() {
     streaming = null;
     setStreamingUi(false);
     setBusyUi();
-    conversations = await loadConversations();
+    // 收尾重载是存储兜底。但重载 await 期间可能已有新发送把提问推进内存版（按钮一恢复
+    // 可点，点击立刻走 send()）——存储快照不含那条消息，整表换过去会把刚发出的提问从
+    // DOM 和后续落盘里洗掉（吞发送竞态的根子）。等待期 preparing 有增量就保持内存版
+    const basePreparing = preparing;
+    const fresh = await loadConversations();
+    if (preparing === basePreparing) conversations = fresh;
     renderConvList();
     renderMessages();
   }
@@ -1415,17 +1472,34 @@ export async function createChatView() {
     if (touched && scrollPinned) R.messages.scrollTop = R.messages.scrollHeight;
   }
 
-  // LLM 问答模式的知识库上下文：授权的单个文件读成文本（文本 / Office；PDF、图片跳过），
-  // 每个最多 30000 字符、合计 80000 字符；文件夹不展开，提示改用任务模式
+  // LLM 问答模式的知识库上下文：返回 { text, attachments }。
+  // 文本 / Office 文件读成文本（单文件 30000 字符、合计 80000 字符预算）；
+  // PDF 不再跳过：转成附件随本轮 user 消息下发（模型原生读，字节预算 PDF_QA_*，
+  // 与字符预算分开算——PDF 走字节通道）；图片仍不读取；文件夹不展开，提示改用任务模式
   async function llmKbContext(conv) {
     const roots = await grantedRoots(conv, { bridge: true });
-    if (!roots.length) return '';
+    if (!roots.length) return { text: '', attachments: null };
     const parts = [];
+    const attachments = [];
     let budget = 80000;
+    let pdfCount = 0;
+    let pdfBytes = 0;
     for (const r of roots.filter((x) => x.kind === 'file')) {
       try {
-        const { text, attachments } = await readFileHandle(r.handle, r.name);
-        if (attachments) { parts.push(`（${r.name} 是 PDF / 图片，问答模式不读取；请切到「LLM 任务」）`); continue; }
+        const { text, attachments: atts } = await readFileHandle(r.handle, r.name);
+        if (atts) {
+          if (atts[0]?.kind !== 'pdf') { parts.push(`（${r.name} 是图片，问答模式不读取；请切到「LLM 任务」）`); continue; }
+          // 轮级字节预算：超了本轮不附（base64 长度 ≈ 原字节 × 4/3）
+          const size = Math.round((atts[0].data.length * 3) / 4);
+          if (pdfCount >= PDF_QA_MAX_FILES || pdfBytes + size > PDF_QA_MAX_TOTAL_BYTES) {
+            parts.push(`（${r.name} 本轮未附：问答模式每轮最多 ${PDF_QA_MAX_FILES} 份 PDF、合计 ${Math.round(PDF_QA_MAX_TOTAL_BYTES / 1048576)} MB，可在知识库移除部分条目）`);
+            continue;
+          }
+          pdfCount += 1;
+          pdfBytes += size;
+          attachments.push(...atts);
+          continue;
+        }
         const t = text.slice(0, Math.min(30000, budget));
         budget -= t.length;
         parts.push(t);
@@ -1436,7 +1510,11 @@ export async function createChatView() {
     }
     const dirs = roots.filter((x) => x.kind === 'dir').map((x) => x.name);
     if (dirs.length) parts.push(`知识库还包含文件夹 ${dirs.join('、')}，问答模式无法读取；如需分析请告诉用户切换到「LLM 任务」引擎。`);
-    return parts.length ? `以下是用户知识库中的文件内容，回答时作为参考：\n\n${parts.join('\n\n---\n\n')}` : '';
+    let text = parts.length ? `以下是用户知识库中的文件内容，回答时作为参考：\n\n${parts.join('\n\n---\n\n')}` : '';
+    if (attachments.length) {
+      text = [text, '用户知识库中的 PDF 文档已作为文件附件附在本轮用户消息上，回答请直接阅读其内容。'].filter(Boolean).join('\n\n');
+    }
+    return { text, attachments: attachments.length ? attachments : null };
   }
 
   // diff 预览：+ / - 行着色（textContent 赋值，防注入）
@@ -1629,6 +1707,12 @@ export async function createChatView() {
     const turnT0 = Date.now();
     const runTimer = setInterval(() => {
       runTime.textContent = `已工作 ${formatDur(Date.now() - turnT0)}`;
+      // 长时间无任何事件帧（增量 / 工具 / 审批都算）：多半是 SDK 或 CLI 卡死。
+      // 只提示不自动收尾——长工具（大安装 / 长构建）本来就静默，误杀比提示代价高
+      if (agentTurn && !agentTurn.stallHinted && Date.now() - agentLastEventAt > 120000) {
+        agentTurn.stallHinted = true;
+        showToast(R.toast, '本轮已 2 分钟无新事件，可能卡住了——点「停止」结束（bridge 无响应时会本地收尾）', 'info', true);
+      }
     }, 1000);
 
     try {
@@ -1673,6 +1757,7 @@ export async function createChatView() {
         done: null,
       };
       agentTurn.donePromise = new Promise((resolve) => { agentTurn.done = resolve; });
+      agentLastEventAt = Date.now();
       // 断线/重启兜底：置 localError 后 resolve donePromise，走正常收尾链落盘
       agentTurn.interrupt = (message) => {
         if (agentTurn.settled) return;
@@ -1722,7 +1807,11 @@ export async function createChatView() {
     streaming = null;
     setStreamingUi(false);
     setBusyUi();
-    conversations = await loadConversations();
+    // 与 LLM 轮收尾同款守卫：重载 await 期间有新发送（或排队消息）推进内存版时保持内存版，
+    // 存储快照不含那条消息，整表替换会把刚发出的提问洗掉
+    const basePreparing = preparing;
+    const fresh = await loadConversations();
+    if (preparing === basePreparing) conversations = fresh;
     renderConvList();
     renderMessages();
     drainAgentQueue(agentId);
@@ -1887,14 +1976,32 @@ export async function createChatView() {
   // 停止按钮：仅 agent 轮（LLM 轮的停止仍是发送按钮切换）。发送按钮在 agent 轮走正常发送 → 入队
   R.stop.addEventListener('click', () => {
     if (!agentTurn) return;
+    // 停止同时撤掉本会话的排队消息：排队消息已作为 user 消息落盘（留在会话记录里），
+    // 撤的只是自动发送——否则本轮收尾后 drainAgentQueue 立刻开下一轮，看起来像停不掉
+    let dropped = 0;
+    for (let i = agentQueue.length - 1; i >= 0; i--) {
+      if (agentQueue[i].convId === agentTurn.conv.id) { agentQueue.splice(i, 1); dropped++; }
+    }
+    if (dropped) showToast(R.toast, `已停止本轮，并取消 ${dropped} 条排队消息的自动发送（消息仍在会话中）`);
+    const turn = agentTurn;
     // 正常路径：bridge 送达取消，turn_end(cancelled) 事件驱动收尾；
-    // bridge 不在线时 cancel 发不出去，turn_end 不会来——本地按「已停止」收尾
-    agentClient.cancel(agentTurn.sessionId).catch(() => {
+    // bridge 不在线时 cancel 发不出去（30s 超时或当场 reject），turn_end 不会来——本地按「已停止」收尾
+    agentClient.cancel(turn.sessionId).catch(() => {
       if (agentTurn?.interrupt) {
         agentTurn.state.stopReason = 'cancelled';
         agentTurn.interrupt(''); // 空错误 + stopReason=cancelled → 按已停止收尾
       }
     });
+    // cancel 送达也未必出 turn_end：老版本 bridge 没有 abort 宽限收场，SDK 卡死时
+    // for await 永不返回。8 秒还没收场就本地收尾，UI 不永久卡流式态；bridge 端轮次
+    // 可能还活着，提示重启 bridge 兜底
+    setTimeout(() => {
+      if (agentTurn === turn && !turn.settled && turn.interrupt) {
+        turn.state.stopReason = 'cancelled';
+        turn.interrupt('');
+        showToast(R.toast, 'SDK 未响应取消，已本地停止本轮；bridge 进程可能仍在跑，可在设置页重启 bridge 兜底', 'error', true);
+      }
+    }, 8000);
   });
 
   async function regenerate() {
@@ -2849,9 +2956,9 @@ export async function createChatView() {
   let hostSeen = false;
   let hostResolve = null;
   const hostReady = new Promise((res) => { hostResolve = res; setTimeout(res, 800); }); // 宿主没回应也不能卡住启动
-  const pageKey = (u) => {
+  function pageKey(u) {
     try { const x = new URL(u); return x.origin + x.pathname + x.search; } catch { return String(u || ''); } // 去掉 #hash：锚点跳转不算换页
-  };
+  }
   let reconcileTries = 0;
   async function reconcileHostCtx() {
     if (!uiReady || !hostSeen) return;
@@ -2863,19 +2970,30 @@ export async function createChatView() {
     reconcileTries = 0;
     const conv = conversations.find((c) => c.id === currentId);
     if (!conv) return;
-    if (!conv.pageCtx) {
-      if (attachPageCtx(conv)) { await saveConversations(conversations); renderCtxRow(); }
+    const hostK = pageKey(hostUrl);
+    // 页绑定优先用持久 pageKey 字段（建会话 / 绑页时写入），老会话回退按 pageCtx.url
+    // 推导（零迁移）；两者都没有 = 从没绑过页（侧边栏会话），不悄悄换绑
+    const bound = conv.pageKey || (conv.pageCtx ? pageKey(conv.pageCtx.url) : '');
+    if (bound === hostK) {
+      // 老会话按 pageCtx 推导命中本页：补写 pageKey 字段（写一次即定格，之后按字段比对）
+      if (!conv.pageKey) { conv.pageKey = hostK; await saveConversations(conversations); }
+      if (!conv.pageCtx && attachPageCtx(conv)) { conv.pageKey = hostK; await saveConversations(conversations); renderCtxRow(); }
       return;
     }
-    if (pageKey(conv.pageCtx.url) === pageKey(hostUrl)) return;
+    if (!bound) {
+      if (attachPageCtx(conv)) { conv.pageKey = hostK; await saveConversations(conversations); renderCtxRow(); }
+      return;
+    }
     if (!conv.items.length) {
       if (cardCtx) conv.pageCtx = cardCtx; else delete conv.pageCtx;
+      conv.pageKey = hostK;
       delete conv.pageCtxSent; // agent 会话：新网页上下文要随首条 prompt 再注入一次
       await saveConversations(conversations);
       renderCtxRow();
       return;
     }
     const nc = newConv('新对话');
+    nc.pageKey = hostK;
     attachPageCtx(nc);
     conversations.unshift(nc);
     currentId = nc.id;
@@ -3165,6 +3283,116 @@ export async function createChatView() {
     renderMessages();
   }
 
+  // ---- PDF 标签页管线（SW 经 chat.html#pdf=<jobId> 派发的一次性任务） ----
+  // 顺序刻意为「先拿数据、再建会话、最后引擎守卫」：下载失败不建会话（无半截副作用）；
+  // 引擎守卫放最后，失败时会话 + 知识库快照已就位，prompt 预填输入框，配好后手动发送即可
+  async function runPdfJob(job) {
+    const name = pdfNameFromUrl(job.url) || job.title || 'document.pdf';
+    showToast(R.toast, `正在下载 PDF：${name}…`, 'info', true);
+    let doc;
+    try {
+      doc = await fetchPdfDocument(job.url);
+    } catch (e) {
+      showToast(R.toast, `PDF 下载失败：${e.message}`, 'error');
+      return;
+    }
+    const sizeText = fmtSize(doc.size);
+    const oversize = doc.size > LIMITS.pdfBytes; // 模型附件单文件上限：超了转 Agent（read_file 分段读）
+    const conv = newConv(job.title || name);
+    applyEngineKey(conv, 'llm'); // PDF 会话以问答起步（可手动切 Agent；切后快照自动同步工作区）
+    conversations.unshift(conv);
+    currentId = conv.id;
+    await saveConversations(conversations);
+    renderConvList();
+    renderMessages();
+    syncEngineUi();
+    // PDF 入会话知识库（快照条目）：字节进 IndexedDB，追问 / 切引擎都在，不用重下
+    const kbId = crypto.randomUUID();
+    const wsPath = `knowledge/${sanitizeName(name)}`;
+    await putSnapshot(kbId, { files: [{ rel: '', file: new File([doc.bytes], name, { type: 'application/pdf' }) }] });
+    await saveKnowledge(conv, [...(conv.knowledge ?? []), { id: kbId, kind: 'snapshot', name, handleKind: 'file', wsPath }]);
+
+    if (job.action === 'chat') {
+      // 分析：只预填不自动发，用户按需改问法
+      if (oversize) showToast(R.toast, `文档 ${sizeText}，超过附件上限 ${fmtSize(LIMITS.pdfBytes)}：问答模式带不上全文，建议切到 Agent 引擎处理`, 'error');
+      R.input.value = '请分析这份 PDF 文档';
+      autoGrow();
+      R.input.focus();
+      return;
+    }
+    if (oversize) {
+      const agentPrompt = buildPdfAgentPrompt({ name, wsPath, outName: `${name.replace(/\.pdf$/i, '')}-译稿.md` });
+      if (!selectedAgent()) {
+        showToast(R.toast, `PDF ${sizeText} 超过附件上限 ${fmtSize(LIMITS.pdfBytes)}：需要 Agent 引擎处理——请先启动 bridge 并登录 agent`, 'error');
+        R.input.value = agentPrompt;
+        autoGrow();
+        R.input.focus();
+        return;
+      }
+      applyEngineKey(conv, 'agent');
+      syncEngineUi();
+      const userItem = newUserItem(conv.id, agentPrompt, '');
+      userItem.meta = { kind: 'pdf-doc', url: job.url, title: job.title || name, action: job.action, sizeText, via: 'agent' };
+      conv.items.push(userItem);
+      await saveConversations(conversations);
+      renderMessages();
+      await runAgentTurn(conv, userItem, selectedAgent());
+      return;
+    }
+    const targetLang = await txTargetLang();
+    const content = job.action === 'translate'
+      ? buildPdfTranslatePrompt({ name, sizeText, targetLang })
+      : buildPdfSummaryPrompt({ name, sizeText });
+    if (!(await ensureEngineAsync())) {
+      R.input.value = content;
+      autoGrow();
+      R.input.focus();
+      return;
+    }
+    const userItem = newUserItem(conv.id, content, '');
+    userItem.meta = { kind: 'pdf-doc', url: job.url, title: job.title || name, action: job.action, sizeText };
+    conv.items.push(userItem);
+    await saveConversations(conversations);
+    renderConvList();
+    renderMessages();
+    // 翻译要可复现、不串味：temperature 0；总结走默认参数
+    if (job.action === 'translate') await runAssistantTurn(conv, userItem, selectedLlm(), { temperature: 0 });
+    else await runAssistantTurn(conv, userItem, selectedLlm());
+  }
+
+  // PDF 翻译目标语言：跟随设置页「网页翻译」的目标语言配置
+  async function txTargetLang() {
+    const settings = await loadSettings();
+    const code = settings.translation?.targetLang;
+    const names = {
+      'zh-CN': '简体中文', 'zh-TW': '繁体中文', en: '英文', ja: '日文', ko: '韩文',
+      fr: '法文', de: '德文', es: '西班牙文', ru: '俄文', pt: '葡萄牙文', it: '意大利文',
+    };
+    return names[code] || code || '简体中文';
+  }
+
+  // 消费 SW 派发的 PDF 任务（chat.html#pdf=<jobId>）：剥 hash（刷新 / 转发不重放）→
+  // 取一次性任务 → runPdfJob。面板 / 聊天卡没有这个 hash，天然跳过
+  async function consumePdfJob() {
+    const raw = location.hash.startsWith('#') ? location.hash.slice(1) : location.hash;
+    const jobId = new URLSearchParams(raw).get('pdf');
+    if (!jobId) return;
+    history.replaceState(null, '', location.pathname + location.search);
+    const key = `omPdfJob:${jobId}`;
+    const o = await chrome.storage.session.get(key);
+    const job = o[key];
+    if (!job) {
+      showToast(R.toast, 'PDF 任务已过期或不存在，请回到原页面重新发起', 'error');
+      return;
+    }
+    await chrome.storage.session.remove(key);
+    try {
+      await runPdfJob(job);
+    } catch (e) {
+      showToast(R.toast, `PDF 处理失败：${e.message || e}`, 'error');
+    }
+  }
+
   // ---- 输入框 ----
   function autoGrow() {
     R.input.style.height = 'auto';
@@ -3202,6 +3430,17 @@ export async function createChatView() {
     try {
       const { pendingTask, pendingPrompt } = await chrome.storage.session.get(['pendingTask', 'pendingPrompt']);
       if (pendingTask) {
+        // 划词提问 / 面板追问是 LLM 快问：卡按页新建的空白会话引擎取全局默认（常为 agent），
+        // 不掰到 LLM 会被下方 agent 守卫拦住等 bridge，提问石沉大海。只动零消息的空白会话，
+        // 用户已有内容的会话引擎不碰（那才是用户自己的选择）。
+        if (pendingTask.kind === 'ask') {
+          const cur = conversations.find((c) => c.id === currentId);
+          if (cur && cur.items.length === 0 && currentEngine() === 'agent') {
+            applyEngineKey(cur, 'llm');
+            await saveConversations(conversations);
+            syncEngineUi();
+          }
+        }
         // 翻译不走聊天引擎，只受 translatePage 内的供应商守卫约束；连读同理（只看 LLM 供应商）。
         // 聊天类任务（快捷动作 / 旧版预填）仍按引擎守卫拦截并保留任务
         if (pendingTask.kind !== 'translate-page' && pendingTask.kind !== 'read-series' && !(await ensureEngineAsync())) return;
@@ -3261,7 +3500,15 @@ export async function createChatView() {
     }
     if (migrated) await saveConversations(conversations);
   }
-  if (!conversations.length) {
+  // 聊天卡按页新建（cardNew 来自 init 顶部的 ?page 标记）：先于「空列表兜底」，
+  // 建出来就置为当前——B 页开卡永远看到自己页的会话，不串全局最近活跃
+  if (cardNew) {
+    const conv = newConv(cardNew.title);
+    conv.pageKey = cardNew.pageKey;
+    conversations.unshift(conv);
+    currentId = conv.id;
+    await saveConversations(conversations);
+  } else if (!conversations.length) {
     const conv = newConv('新对话');
     conversations.push(conv);
     currentId = conv.id;
@@ -3278,6 +3525,7 @@ export async function createChatView() {
   (window.parent !== window ? hostReady : Promise.resolve()).then(async () => {
     uiReady = true;
     await reconcileHostCtx();
+    await consumePdfJob(); // PDF 标签页任务（独立聊天页专用 hash），无 hash 即跳过
     consumePendingTask();
   });
   // 面板已打开时，浮窗/右键新写入的任务实时消费（无需重开面板）。
@@ -3290,14 +3538,16 @@ export async function createChatView() {
   // 多视图同步：侧边栏/聊天页/聊天卡各自持有内存 conversations，任一视图
   // 写 storage 后其余视图重载。流式中跳过（turn 收尾本就 loadConversations 兜底），
   // 防止 stale 全量写复活已删会话。防抖 200ms 合并连续写；内容一致即自己写的，跳过。
+  // patchConversation 在途（含存储尚无会话的重试窗口）同样让路：内存已含 patch，
+  // 此时以存储刷新内存会把 patch 回滚掉
   let syncTimer = 0;
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local' || !changes.conversations) return;
     clearTimeout(syncTimer);
     syncTimer = setTimeout(async () => {
-      if (streaming || preparing) return;
+      if (streaming || preparing || patchPending) return;
       const fresh = await loadConversations();
-      if (streaming || preparing) return; // 读存储期间开始了发送：同样放弃替换
+      if (streaming || preparing || patchPending) return; // 读存储期间 patch 又启动了：同样放弃替换
       if (JSON.stringify(fresh) === JSON.stringify(conversations)) return;
       conversations = fresh;
       if (!conversations.some((c) => c.id === currentId)) currentId = conversations[0]?.id ?? '';
@@ -3311,6 +3561,20 @@ export async function createChatView() {
       renderMessages();
       syncEngineUi();
     }, 200);
+  });
+
+  // 页面销毁前尽力收尾（聊天卡随宿主页关闭 / 独立聊天页与侧边栏关标签页都触发）：
+  // agent 轮向 bridge 发取消——pagehide 时 WS 通常还开着，帧能发出；bridge「断开不杀、
+  // 重连补帧」语义不动（扩展页重载重连靠它），帧丢失的残窗口接受。LLM 流式中止请求并
+  // 尽力落盘尾部。全部 fire-and-forget，页面销毁路径里不能 await
+  window.addEventListener('pagehide', () => {
+    if (agentTurn?.sessionId) {
+      try { agentClient.cancel(agentTurn.sessionId).catch(() => { /* 已断开 */ }); } catch { /* 上下文已失效 */ }
+    }
+    if (streaming?.kind === 'llm') {
+      try { streaming.abort?.abort(); } catch { /* 已中止 */ }
+      try { streaming.flushNow?.(); } catch { /* 页面正在销毁 */ }
+    }
   });
 
   return { renderMessages, renderConvList, renderModelOptions };

@@ -96,18 +96,23 @@ try {
   await optSess.send('Runtime.enable');
   const seed = await evalIn(optSess, `(async () => {
     const now = Date.now();
+    // 聊天卡按宿主页绑定会话（pageKey）：两个场景页各绑一条，卡 init 才会恢复而不是新建绑页空会话
+    const mkConv = (id, pk) => ({
+      id, title: '复制测试', createdAt: now, updatedAt: now, engine: 'llm', pageKey: pk,
+      items: [
+        { id: id + ':q', conversationId: id, type: 'question', parentItemId: '', content: '问题', createdAt: now },
+        { id: id + ':a', conversationId: id, type: 'answer', parentItemId: id + ':q', content: 'COPY-ME-12345', model: 'fake-model', createdAt: now, stopped: false, error: '' },
+      ],
+    });
     await chrome.storage.local.set({
       llmSettings: {
         providers: [{ id: 'p1', name: 'fake', kind: 'openai', baseUrl: 'http://127.0.0.1:${WEB}/v1', apiKey: 'k', models: ['fake-model'] }],
         activeProviderId: 'p1',
       },
-      conversations: [{
-        id: 'conv:t', title: '复制测试', createdAt: now, updatedAt: now, engine: 'llm',
-        items: [
-          { id: 'msg:q', conversationId: 'conv:t', type: 'question', parentItemId: '', content: '问题', createdAt: now },
-          { id: 'msg:a', conversationId: 'conv:t', type: 'answer', parentItemId: 'msg:q', content: 'COPY-ME-12345', model: 'fake-model', createdAt: now, stopped: false, error: '' },
-        ],
-      }],
+      conversations: [
+        mkConv('conv:p', 'http://127.0.0.1:${WEB}/page'),
+        mkConv('conv:s', 'http://127.0.0.1:${WEB}/strict'),
+      ],
     });
     return 'ok';
   })()`);

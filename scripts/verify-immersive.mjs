@@ -1,6 +1,8 @@
-// 一次性 e2e：沉浸翻译全链路。本地起假 OpenAI SSE 服务 + 测试页（纯文本段/带链接段/带行内代码段），
+// 一次性 e2e：沉浸翻译全链路。本地起假 OpenAI SSE 服务 + 测试页（纯文本段/带链接段/带行内代码段/语法高亮代码块），
 // 浮窗「翻译此页」点击 → runner 跑管线 → 断言沉浸模式三段全部整块替换（旧行为：带 <a>/<code>
 // 的块降级成对照插入）；再点一次翻译按钮 → 断言原文与行内标记（<a>/<code>）按快照完整还原。
+// 代码块回归：Pygments 式逐 token span 在 pre 内，必须整体不收录（旧缺陷：兜底 a/span 扫描
+// 不看祖先，高亮 span 逐个收录，翻译中标记逐行打进代码块、伪译文破坏代码展示）。
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -19,6 +21,13 @@ const PAGE = `<!doctype html><html><body>
 <p id="plain">The quick brown fox jumps over the lazy dog near the river bank.</p>
 <p id="linked">See the <a href="https://example.com/docs">official documentation</a> for advanced usage.</p>
 <p id="coded">Run <code>npm install vela</code> first, then start the bridge process.</p>
+<pre id="codeblk"><code><span class="k">CREATE</span> <span class="k">TABLE</span> employee_information (
+  <span class="n">emp_id</span> <span class="t">INT</span>,
+  name <span class="t">STRING</span>,
+  dept_id <span class="t">INT</span>
+) <span class="k">WITH</span> (
+  <span class="s">'connector'</span> = <span class="s">'datagen'</span>
+);</code></pre>
 </body></html>`;
 const server = createServer((req, res) => {
   console.log('[web]', req.method, req.url);
@@ -188,6 +197,17 @@ try {
   check('带链接段整块替换（旧行为降级对照）', st.linked?.includes('【中】') === true, JSON.stringify(st.linked));
   check('带行内代码段整块替换（旧行为降级对照）', st.coded?.includes('【中】') === true, JSON.stringify(st.coded));
   check('沉浸模式无对照插入节点', st.dst === 0, `dst=${st.dst}`);
+
+  // 代码块整体不译：pre 内无收录标记、无翻译中标记、内容与伪译文零接触
+  const codeSt = JSON.parse(await evalInPage(sess, `JSON.stringify({
+    marked: document.querySelectorAll('#codeblk [data-om-tx]').length,
+    wait: document.querySelectorAll('#codeblk .om-tx-wait, #codeblk [data-om-tx]').length,
+    text: document.getElementById('codeblk').textContent,
+    spans: document.querySelectorAll('#codeblk span').length,
+  })`));
+  check('代码块内零收录（pre 内无 data-om-tx）', codeSt.marked === 0, JSON.stringify({ marked: codeSt.marked }));
+  check('代码块内容原样（无伪译文混入）', codeSt.text.includes('CREATE TABLE employee_information') && codeSt.text.includes("'datagen'") && !codeSt.text.includes('【中】'), JSON.stringify(codeSt.text.slice(0, 80)));
+  check('代码块 token span 数量不变', codeSt.spans === 9, `spans=${codeSt.spans}`);
 
   // 再点一次 = 还原原文；行内 <a>/<code> 按快照恢复
   await evalInPage(sess, `document.getElementById('om-widget-host').shadowRoot.querySelector('[data-act="translate-page"]').click()`);

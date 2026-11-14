@@ -169,12 +169,14 @@
 
   // 增强绘制（0.7.10 像素终验失败时启用）：box-shadow inset 与 outline 是独立于 background
   // 的绘制层，只按 background-color/-image 下手的覆盖（深色类扩展常见改法）压不住它们；
-  // 内联 !important 又压过页面样式表的 !important。
+  // 内联 !important 又压过页面样式表的 !important。background-clip 一并压回 border-box、
+  // 字色强制实色：破「背景裁进字形（background-clip:text）+ 透明字色」类压制——
+  // 该签名下文字照常显示、背景消失，与用户报障现象吻合。
   function escalateHlPaint(span) {
     if (span.dataset.hlBoost) return;
     span.dataset.hlBoost = '1';
     const c = HL_COLORS[span.dataset.c || 'y'];
-    span.style.cssText += `;box-shadow:inset 0 0 0 999px ${c.bg} !important;outline:2px solid ${c.bg} !important;outline-offset:-2px;`;
+    span.style.cssText += `;box-shadow:inset 0 0 0 999px ${c.bg} !important;outline:2px solid ${c.bg} !important;outline-offset:-2px;background-clip:border-box !important;-webkit-background-clip:border-box !important;-webkit-text-fill-color:#333 !important;`;
   }
 
   // ---------- 高亮 → 本页思维导图素材（写库走 SW，本地只报增量 + 轻提示） ----------
@@ -226,9 +228,58 @@
     return spans.length;
   }
 
+  // 跨块选区按块级宿主分组、每块各包一个 span。单一 span 包跨块内容会把 <p>/<li> 等
+  // 块级片段装进 inline span（块内行内），Chrome 对这种结构不绘制 span 自身背景——
+  // DOM computed 全绿、文字照常显示、屏幕一个色像素都没有（Flink 文档页与本机夹具
+  // 双重复现；像素终验两连败 + 对照探针显色定性为「非环境因素」）。按块拆开后每段
+  // 都是纯行内分片，背景照常逐行盒绘制（box-decoration-break:clone 管块内跨行）。
+  const isBlockish = (el) => {
+    const d = getComputedStyle(el).display;
+    return d !== 'inline' && d !== 'inline-block' && d !== 'contents' && d !== 'none';
+  };
+  const blockHostOf = (node, stopAt) => {
+    for (let el = node.parentElement; el; el = el.parentElement) {
+      if (isBlockish(el)) return el;
+      if (el === stopAt || el === document.body) break;
+    }
+    return stopAt.nodeType === 1 ? stopAt : stopAt.parentElement; // 全行内链的兜底宿主
+  };
+  function wrapRangePerBlock(range) {
+    // range 相交的文本节点按块级宿主分组（TreeWalker 文档序；元素边界端点自动落到 0/length 偏移）
+    const root = range.commonAncestorContainer.nodeType === 1 ? range.commonAncestorContainer : range.commonAncestorContainer.parentNode;
+    const groups = new Map();
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      if (!range.intersectsNode(n)) continue;
+      if (!/\S/.test(n.data)) continue; // 纯空白节点（块间换行等）没有行盒，包了只会造出 0x0 span
+      const host = blockHostOf(n, root);
+      if (!groups.has(host)) groups.set(host, []);
+      groups.get(host).push(n);
+    }
+    const spans = [];
+    for (const [host, nodes] of groups) {
+      const firstN = nodes[0];
+      const lastN = nodes[nodes.length - 1];
+      const sub = document.createRange();
+      sub.setStart(firstN, firstN === range.startContainer ? range.startOffset : 0);
+      sub.setEnd(lastN, lastN === range.endContainer ? range.endOffset : lastN.length);
+      if (sub.collapsed) continue;
+      const wrap = document.createElement('span');
+      wrap.className = 'om-hl';
+      applyHlColor(wrap, 'y'); // 内联底色：默认黄
+      try {
+        wrap.appendChild(sub.extractContents());
+        sub.insertNode(wrap);
+        if (wrap.isConnected && wrap.textContent.trim()) spans.push(wrap);
+      } catch { /* 跨特殊节点切不动就跳过这一段 */ }
+    }
+    return spans;
+  }
+
   // 已在高亮内的选区再点一次 = 取消；否则把每个 range 的内容包进 .om-hl span。
   // 全部走克隆 Range：点击瞬间活选区被清也能正常工作。
-  // extractContents 天然处理跨节点切分，插回 span 后视觉连续（box-decoration-break:clone）
+  // extractContents 天然处理跨节点切分，插回 span 后视觉连续（box-decoration-break:clone）；
+  // 跨块选区按块级宿主拆成多个 span（wrapRangePerBlock），防块内行内结构吞绘制
   function toggleHighlight(st) {
     ensureHlStyle();
     if (st.anchorEl?.closest('.om-hl') && st.focusEl?.closest('.om-hl')) {
@@ -246,20 +297,14 @@
     const added = [];
     let first = null;
     for (const range of st.ranges) {
-      const wrap = document.createElement('span');
-      wrap.className = 'om-hl';
-      applyHlColor(wrap, 'y'); // 内联底色：默认黄
-      try {
-        wrap.appendChild(range.extractContents());
-        range.insertNode(wrap);
-        if (wrap.isConnected && wrap.textContent.trim()) {
-          if (!first) first = wrap;
-          added.push(wrap.textContent); // 素材取自实际落 DOM 的 span（跨节点切分后仍与选区一致）
-        }
-      } catch { /* 跨特殊节点切不动就跳过这一段 */ }
+      for (const wrap of wrapRangePerBlock(range)) {
+        if (!first) first = wrap;
+        added.push(wrap.textContent); // 素材取自实际落 DOM 的 span（跨节点切分后仍与选区一致）
+      }
     }
     if (added.length) collectMindmap('add', added);
-    // 即时反馈：高亮生成后直接挂出悬停胶囊（Monica 式），不用再悬停一次才能看到操作项
+    // 即时反馈：高亮生成后直接挂出悬停胶囊（Monica 式），不用再悬停一次才能看到操作项。
+    // 自检挂在首块 span 上：所有块用的同一构造与 CSS，逐块进管线只放大监测开销
     if (first) { showHlBtn(first); diagnoseHl(first); }
   }
 
@@ -269,7 +314,12 @@
   // DOM 检查看不到的绘制层。现在 400ms 首检（computed 底色/尺寸/遮挡/内联样式）通过后：
   // 1s×15s 监测移除/颜色覆盖（覆盖先自动修复最多 3 次）；700ms/5.2s/12s 三次像素终验——
   // SW 代截当前视口，canvas 按 span 矩形采样，未测到高亮色先增强绘制复验，仍无色才红
-  // toast 报障；15s 之外由 MutationObserver 兜晚期移除。
+  // toast 报障；15s 之外由 MutationObserver 兜晚期移除。两类页面像素坐标/颜色前提不成立，
+  // 终验静默跳过不报障：祖先链带 filter / mix-blend-mode（暗色/护眼改色，computed 不变但
+  // 屏幕已变色）、页面捏合缩放（截屏与 DOM 坐标不同系）。失败 toast 内嵌采样区实际截屏
+  // 缩略图（canvas 直绘，绕开页面 img-src CSP）与占比/均值——用户截图 toast 即完成取证，
+  // 不再依赖控制台；像素类报障每次会话只完整弹一次（sessionStorage 去重，复发仅 console）。
+  // 「截屏空白」（均值贴黑/白边）与「画了但颜色被改」（均值有色）由均值可分辨。
   let hlSelfRemoved = false; // 用户经胶囊自己删除/取消不算外部移除
   let hlRepairs = 0;
   function diagnoseHl(span) {
@@ -280,15 +330,40 @@
     const elapsed = () => ((Date.now() - t0) / 1000).toFixed(1);
     const norm = (v) => String(v || '').replace(/\s+/g, '').replace(/(^|[^\d])\./g, '$10.'); // '.6' → '0.6'，与 computed 归一成同一写法
     const wantBg = () => norm(HL_COLORS[span.dataset.c || 'y'].bg); // 胶囊换色后按新色监测
-    const fail = (msg) => {
-      try { console.warn(`[Vela] 高亮颜色未生效 v${VER} | ${msg}`); } catch { /* 页面禁 console */ }
+    const fail = (msg, evidence) => {
+      // 占比 / 均值 / 采样框直接进 toast 文案：报障截图不再依赖控制台就能定性
+      const detail = evidence && evidence.ratio !== undefined
+        ? `（占比=${(evidence.ratio * 100).toFixed(1)}%，采样区均值=rgb(${evidence.mean ? evidence.mean.join(',') : '?'}），采样框${evidence.box ? evidence.box[2] + 'x' + evidence.box[3] : '?'}px）`
+        : '';
+      try { console.warn(`[Vela] 高亮颜色未生效 v${VER} | ${msg}${detail}`); } catch { /* 页面禁 console */ }
+      // 像素类报障是环境级（同一台机器每次高亮都会复现），完整弹窗每次会话只报一次，
+      // 复发仅留 console——否则逐次高亮反复弹红框，功能没法用。sessionStorage 按 origin
+      // 隔离，同站换页不重报；无证据的失败（被遮挡/被移除等）仍逐次弹。
+      if (evidence) {
+        try {
+          if (sessionStorage.getItem('om-hl-pix-fail')) return;
+          sessionStorage.setItem('om-hl-pix-fail', '1');
+        } catch { /* 沙箱页 storage 不可用，照常弹 */ }
+      }
       const t = document.createElement('div');
       t.id = 'om-hl-diag';
       // 文案带版本号：报障截图一眼可分辨新旧内容脚本（旧页面不刷新会一直跑旧代码）
-      t.textContent = `[Vela v${VER}] 高亮颜色未生效：${msg}`;
+      t.textContent = `[Vela v${VER}] 高亮颜色未生效：${msg}${detail}`;
       t.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;max-width:440px;padding:10px 14px;background:#2b1c1c;color:#ffb4ab;border:1px solid #f28b82;border-radius:8px;font:13px/1.5 system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.3)';
+      if (evidence?.thumb) {
+        // 高亮位置的实际截屏缩略图直接画进 toast：用 canvas 而非 <img>，不受页面
+        // img-src CSP 限制。用户截图 toast 即带回像素层证据，不再需要控制台截图。
+        const c = evidence.thumb;
+        c.style.cssText = 'display:block;margin-top:8px;max-width:100%;border:1px solid currentColor;background:#fff';
+        t.appendChild(c);
+        const hint = document.createElement('div');
+        hint.style.cssText = 'margin-top:6px;opacity:.85';
+        hint.textContent = '上图 = 高亮位置实际截屏（对照探针已验证截屏可信）：有文字无黄色底 → 高亮绘制被页面/其他扩展拦截。点击本提示关闭，截图反馈。';
+        t.appendChild(hint);
+      }
       (document.body || document.documentElement).appendChild(t);
-      setTimeout(() => t.remove(), 12000);
+      t.addEventListener('click', () => t.remove(), { once: true });
+      setTimeout(() => t.remove(), 20000);
     };
     setTimeout(() => {
       if (!span.isConnected) { fail('高亮 span 生成后立刻被移除（疑似其他扩展改写了 DOM）'); return; }
@@ -296,6 +371,9 @@
       const bg = cs.backgroundColor;
       const r0 = span.getBoundingClientRect();
       if (!r0.width || !r0.height) { fail(`span 尺寸为 ${Math.round(r0.width)}x${Math.round(r0.height)}（display=${cs.display}）`); return; }
+      // 整体透明（span 或祖先链 opacity≈0）：连文字都会消失，属明确根因，点名报出。
+      // 正常报障场景文字可见、opacity=1，走不到这里——这条只为收窄诊断面。
+      if (parseFloat(cs.opacity) < 0.05) { fail(`元素链 opacity=${cs.opacity}，整段被透明化`); return; }
       const inlineOk = norm(span.style.backgroundColor) === wantBg() || norm(span.style.backgroundImage).includes(wantBg());
       if (norm(bg) !== norm('rgba(255, 222, 89, 0.6)')) { fail(`computed 背景=${bg}（期望 rgba(255, 222, 89, 0.6)），内联样式${inlineOk ? '在' : '丢失'} — 页面或其他扩展覆盖了颜色`); return; }
       // 遮挡判定按行盒逐个取中心点，任一行盒命中本高亮即算可见。不能取外接矩形中心：
@@ -308,12 +386,23 @@
       for (const rc of span.getClientRects()) {
         if (rc.width < 2 || rc.height < 2) continue;
         const el = document.elementsFromPoint(rc.left + rc.width / 2, rc.top + rc.height / 2).find((x) => !ownLayer(x));
-        if (el && (el === span || el.closest('.om-hl') === span)) { visible = true; break; }
+        // 命中本 span / span 后代 = 正常可见。命中 span 祖先不算遮挡：祖先绘制在后代
+        // 之下，高亮背景仍可见——Google 结果卡（<a><h3>标题</h3></a>）把 hit-test 让给
+        // 外层 <a> 时，span 接不到命中点，此前误报「被 A 遮挡」而高亮明明画着
+        if (el && (el === span || el.closest('.om-hl') === span || el.contains(span))) { visible = true; break; }
         hit = hit || el;
       }
       if (!visible && hit) { fail(`被 ${hit.tagName + (hit.id ? '#' + hit.id : '')} 遮挡，颜色画了但看不见`); return; }
       if (!inlineOk) { fail('内联底色丢失，仅剩样式表链路'); return; }
       try { console.info(`[Vela] 高亮已应用 v${VER} | 底色=${bg} 矩形=${Math.round(r0.width)}x${Math.round(r0.height)} 位置=(${Math.round(r0.left)},${Math.round(r0.top)})`); } catch { /* 页面禁 console */ }
+      // 祖先链 filter / mix-blend-mode 检测（暗色、护眼类扩展的 filter 模式）：computed 样式
+      // 不变、DOM 检查全绿，但屏幕像素整体变色，像素终验必空报——祖先命中即跳过终验。
+      // 从 parentElement 起步：filter 落在 .om-hl 本身（页面样式表点名吃高亮渲染）保持报障路径
+      let filterBy = null;
+      for (let el = span.parentElement; el && el.nodeType === 1; el = el.parentElement) {
+        const c2 = getComputedStyle(el);
+        if ((c2.filter && c2.filter !== 'none') || (c2.mixBlendMode && c2.mixBlendMode !== 'normal')) { filterBy = el; break; }
+      }
       // 像素终验（0.7.10）：把「样式算了」升级成「屏幕画了」。截屏由 SW 代做（内容脚本
       // 无 captureVisibleTab 权限），dataUrl 画进 canvas 后按 span 视口矩形采样，按色相族
       // 判定（黄系覆盖白底合成 ≈(255,235,155) 与深底/强制深色的暗琥珀）。未测到色先增强
@@ -324,11 +413,11 @@
         if (key === 'p') return (r, g, b) => r - g > 30 && b - g > 18 && r > 120;
         return (r, g, b) => r - b > 35 && g - b > 20 && r > 40; // 黄系：白底≈(255,235,155)，暗琥珀≈(56,40,4)
       };
-      const sampleRect = async () => {
-        const r0 = span.getBoundingClientRect();
-        if (r0.bottom < 0 || r0.top > window.innerHeight || r0.right < 0 || r0.left > window.innerWidth) return { skip: '高亮已滚出视口' };
+      // 截屏 → 位图画布。截屏由 SW 代做（内容脚本无 captureVisibleTab 权限），
+      // 高亮采样与对照探针共用这一条链路，保证两者看到的是同一只镜头。
+      const shotCanvas = async () => {
         const shot = await new Promise((resolve) => send({ type: 'om:capture-visible-tab' }, (r) => resolve(r && r.ok ? r.dataUrl : null)));
-        if (!shot) return { skip: '无法截屏' };
+        if (!shot) return null;
         const img = new Image();
         await new Promise((res2, rej2) => { img.onload = res2; img.onerror = rej2; img.src = shot; }); // 页面 CSP 拦 data: 图片时抛出走跳过
         const cv = document.createElement('canvas');
@@ -336,18 +425,86 @@
         cv.height = img.naturalHeight;
         const cx = cv.getContext('2d', { willReadFrequently: true });
         cx.drawImage(img, 0, 0);
-        const scale = img.naturalWidth / window.innerWidth;
-        const x0 = Math.max(0, Math.round(r0.left * scale)), y0 = Math.max(0, Math.round(r0.top * scale));
-        const x1 = Math.min(cv.width, Math.round(r0.right * scale)), y1 = Math.min(cv.height, Math.round(r0.bottom * scale));
-        if (x1 - x0 < 8 || y1 - y0 < 8) return { skip: '矩形过小' };
+        return { cx, scale: img.naturalWidth / window.innerWidth };
+      };
+      // 按视口矩形采样位图：黄色占比 / 均值 / 缩略画布（fail 时嵌进报障 toast）
+      const scanRegion = (cxInfo, rect) => {
+        const { cx, scale } = cxInfo;
+        const x0 = Math.max(0, Math.round(rect.left * scale)), y0 = Math.max(0, Math.round(rect.top * scale));
+        const x1 = Math.min(cx.canvas.width, Math.round(rect.right * scale)), y1 = Math.min(cx.canvas.height, Math.round(rect.bottom * scale));
+        if (x1 - x0 < 8 || y1 - y0 < 8) return null;
         const d = cx.getImageData(x0, y0, x1 - x0, y1 - y0).data;
         const pred = colorPred(span.dataset.c || 'y');
-        let hit = 0;
-        for (let i = 0; i < d.length; i += 4) if (pred(d[i], d[i + 1], d[i + 2])) hit++;
-        return { ratio: hit / (d.length / 4) };
+        let hit = 0, sr = 0, sg = 0, sb = 0;
+        for (let i = 0; i < d.length; i += 4) { sr += d[i]; sg += d[i + 1]; sb += d[i + 2]; if (pred(d[i], d[i + 1], d[i + 2])) hit++; }
+        const n = d.length / 4;
+        // 采样区均值进失败日志：截屏全白/全黑（均值贴边）与「画了但颜色被改」（均值有色）两种根因可分辨
+        const tw = Math.min(240, x1 - x0);
+        const th = Math.max(24, Math.round((y1 - y0) * tw / (x1 - x0)));
+        const thumb = document.createElement('canvas');
+        thumb.width = tw;
+        thumb.height = th;
+        thumb.getContext('2d').drawImage(cx.canvas, x0, y0, x1 - x0, y1 - y0, 0, 0, tw, th);
+        return { ratio: hit / n, mean: [Math.round(sr / n), Math.round(sg / n), Math.round(sb / n)], box: [x0, y0, x1 - x0, y1 - y0], thumb };
+      };
+      const sampleRect = async () => {
+        const r0 = span.getBoundingClientRect();
+        if (r0.bottom < 0 || r0.top > window.innerHeight || r0.right < 0 || r0.left > window.innerWidth) return { skip: '高亮已滚出视口' };
+        // 捏合缩放（visualViewport）下 getBoundingClientRect 与截屏坐标不同系，采样会读错区域
+        if ((window.visualViewport?.scale || 1) > 1.01) return { skip: '页面捏合缩放中' };
+        const cxInfo = await shotCanvas();
+        if (!cxInfo) return { skip: '无法截屏' };
+        return scanRegion(cxInfo, r0) ?? { skip: '矩形过小' };
+      };
+      // 对照探针终审：报障前先在视口左上角画一粒实心黄色小块（不透明、无滤镜链、fixed
+      // 顶层），走同一条截屏链路截下来验色。探针显色而高亮不显色 → 截屏链路可信，
+      // 绘制确实被针对拦截，报障才站得住；探针也不显色 → 截屏或全局色彩链路本身
+      // 不可信（系统色彩滤镜、GPU 合成、截屏 API 环境差异），用户眼睛多半看得见高亮，
+      // 不判 vela 故障、不弹报障——这是「每次高亮都弹红框」假警报的截断器。
+      // 返回 'paint'（真压制）/ 'global'（链路不可信）/ 'flaky'（探针时序抖动）/ 'recovered'
+      const probeVerdict = async () => {
+        const hlKey = span.dataset.c || 'y';
+        const probe = document.createElement('div');
+        probe.id = 'om-hl-probe';
+        // 探针底色与高亮同色相（alpha 抬到 1）：绿色高亮配黄色探针过不了绿色 pred，
+        // 会把真压制误判成链路不可信而漏报
+        probe.style.cssText = `position:fixed;left:10px;top:10px;width:34px;height:14px;background:${HL_COLORS[hlKey].bg.replace(/[\d.]+\)$/, '1)')};border-radius:3px;z-index:2147483647;pointer-events:none;forced-color-adjust:none`;
+        (document.body || document.documentElement).appendChild(probe);
+        try {
+          // rAF 保证样式布局过完，再留 100ms 给合成器上屏，防截到探针落位前的帧
+          await new Promise((r2) => requestAnimationFrame(() => setTimeout(r2, 100)));
+          const pred = colorPred(hlKey);
+          const c1 = await shotCanvas();
+          const p1 = c1 && scanRegion(c1, probe.getBoundingClientRect());
+          if (p1 && p1.ratio >= 0.5) return 'paint';
+          // 探针没显色：先排除截屏时序抖动，350ms 后重试一轮；第二轮连高亮一起复扫，
+          // 高亮自己显色了就按恢复处理
+          await new Promise((r2) => setTimeout(r2, 350));
+          const c2 = await shotCanvas();
+          const p2 = c2 && scanRegion(c2, probe.getBoundingClientRect());
+          if (p2 && p2.ratio >= 0.5) return 'flaky';
+          if (c2) {
+            const s3 = scanRegion(c2, span.getBoundingClientRect());
+            if (s3 && s3.ratio >= 0.05) {
+              span.dataset.hlPix = 'ok';
+              try { console.info(`[Vela] 像素验证通过（复测测到高亮色，此前为截屏时序抖动）v${VER}`); } catch { /* 页面禁 console */ }
+              return 'recovered';
+            }
+          }
+          return 'global';
+        } finally {
+          probe.remove();
+        }
       };
       const pixelCheck = async () => {
         if (!span.isConnected || document.visibilityState !== 'visible' || span.dataset.hlPix === 'ok') return;
+        // 祖先链 filter / mix-blend-mode（暗色、护眼类扩展的 filter 模式，网站自带暗色滤镜同理）
+        // 不改 computed 样式——DOM 检查全绿——但屏幕像素已整体变色，按原色预测采样必空。
+        // 这类页面像素终验直接跳过（与「无法截屏」同级），不做红色报障。
+        if (filterBy) {
+          try { console.info(`[Vela] 像素验证跳过：祖先 ${filterBy.tagName}${filterBy.id ? '#' + filterBy.id : ''} 带 filter/mix-blend-mode（暗色/护眼改色，屏幕颜色不可按原色预期）v${VER}`); } catch { /* 页面禁 console */ }
+          return;
+        }
         try {
           const s1 = await sampleRect();
           if (s1.skip) { try { console.info(`[Vela] 像素验证跳过（${s1.skip}）v${VER}`); } catch { /* 页面禁 console */ } return; }
@@ -369,9 +526,26 @@
             return;
           }
           if (span.dataset.hlPix === 'fail') return;
+          // 探针终审：只有「对照探针显色、高亮不显色」才值得报障。探针也不显色说明
+          // 截屏/全局色彩链路不可信（这类环境里报障是假警报，用户眼睛看得见高亮），
+          // 静默跳过，留 console 供排查。
+          const verdict = await probeVerdict();
+          if (verdict !== 'paint') {
+            if (verdict === 'global') {
+              try { console.warn(`[Vela] 屏幕未测到高亮色，但对照探针同样未显色 — 截屏/全局色彩链路不可信（系统色彩滤镜、GPU 合成等环境因素），不判 vela 高亮故障，跳过报障 v${VER}`); } catch { /* 页面禁 console */ }
+            }
+            return;
+          }
           span.dataset.hlPix = 'fail';
-          fail('屏幕像素未测到高亮色（DOM 样式正常，增强绘制无效）— 疑似页面或其他扩展拦截绘制，请截图此提示与控制台反馈');
-          try { console.warn(`[Vela] 像素验证失败 v${VER} | 屏幕未测到高亮色（占比=${((s2.ratio ?? s1.ratio) * 100).toFixed(1)}%），DOM 样式正常，已增强绘制仍无效 — 疑似页面或其他扩展拦截绘制`); } catch { /* 页面禁 console */ }
+          // 证据随报障走：toast 里带实际截屏缩略图与占比/均值，用户截图 toast 即完成反馈闭环
+          fail('屏幕像素未测到高亮色（对照探针正常显色，确认高亮绘制被页面/扩展拦截）— 下方为高亮位置实际截屏', {
+            thumb: s2.thumb ?? s1.thumb,
+            ratio: s2.ratio ?? s1.ratio,
+            mean: s2.mean ?? s1.mean,
+            box: s2.box ?? s1.box,
+          });
+          const mean = s2.mean ?? s1.mean;
+          try { console.warn(`[Vela] 像素验证失败 v${VER} | 屏幕未测到高亮色（占比=${((s2.ratio ?? s1.ratio) * 100).toFixed(1)}%，采样区均值=rgb(${mean ? mean.join(',') : '?'}），bg-clip=${cs.webkitBackgroundClip || cs.backgroundClip}，字色填充=${cs.webkitTextFillColor}），对照探针正常显色，确认拦截只作用于高亮 — 页面或其他扩展针对性压制绘制`); } catch { /* 页面禁 console */ }
         } catch {
           try { console.info(`[Vela] 像素验证跳过（页面限制）v${VER}`); } catch { /* 页面禁 console */ }
         }
@@ -486,6 +660,8 @@
     } else {
       for (const [act, icon, title] of [
         ['highlight', 'hl', '高亮（再点已高亮内容可取消）'],
+        // 选中的是已高亮文字时给显式删除钮：此前只有高亮钮亮态（再点=取消），语义太藏
+        ...(hlOn ? [['del-hl', 'trash', '删除此高亮']] : []),
         ['translate', 'translate', '翻译选中文字'],
         ['summary', 'summary', '总结选中文字'],
         ['mindmap', 'mind', '查看本页思维导图：划词高亮的内容会自动收集，页内点「生成」整理成图'],
@@ -528,8 +704,8 @@
     destroy(); // 动作一经触发先收工具条，选区已在弹出时克隆缓存
     if (!st) return;
     const act = btn.dataset.act;
-    if (act === 'highlight') {
-      toggleHighlight(st);
+    if (act === 'highlight' || act === 'del-hl') {
+      toggleHighlight(st); // del-hl：选区在高亮内，toggle 走取消分支
       try { window.getSelection()?.removeAllRanges(); } catch { /* 选区已不存在 */ }
       return;
     }
@@ -568,7 +744,17 @@
 
   let lastState = null; // 最后一笔有效选区（含克隆 Range）：点击时活选区被清也能执行
 
+  // 本页暂停（widget.js 写入的 sessionStorage 标记）：自动化场景下不再注入任何悬浮元素。
+  // 只读不清——同址刷新的清除由 widget.js 注入时做（同 world、注册序在先）
+  const pagePaused = () => {
+    try {
+      const st = JSON.parse(sessionStorage.getItem('om-page-paused') || 'null');
+      return !!(st && st.u);
+    } catch { return false; }
+  };
+
   function show() {
+    if (pagePaused()) { destroy(); return; }
     const st = currentSelection();
     if (!st) {
       destroy();
@@ -687,6 +873,7 @@
   }
 
   function showCodeBtn(pre) {
+    if (pagePaused()) return;
     const text = (pre.innerText || '').trim();
     if (text.length < 12 || ownUi(pre) || panelOpen()) return;
     cbtnPre = pre;
@@ -782,7 +969,7 @@
   }
 
   function showHlBtn(span) {
-    if (ownUi(span) || panelOpen()) return;
+    if (pagePaused() || ownUi(span) || panelOpen()) return;
     hlBtnSpan = span;
     hlBtnHost = document.createElement('div');
     hlBtnHost.id = HBTN_ID;

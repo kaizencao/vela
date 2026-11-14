@@ -130,6 +130,48 @@ export function buildVideoFramesPrompt({ mode, count, note = '' }) {
   return [ask, `共 ${count} 帧，按时间先后排列${note ? `（${note}）` : ''}。`].join('\n');
 }
 
+// ---- PDF 文档（标签页管线：PDF 原文件随 user 消息附件下发，模型原生读） ----
+
+export function buildPdfSummaryPrompt({ name, sizeText }) {
+  return [
+    `请总结下面这份 PDF 文档，用中文回复：`,
+    `1. 先用 2-3 句话概括核心内容；`,
+    `2. 再按文档自身的章节结构分点列出关键信息（最多 10 条）；`,
+    `3. 如有数据、结论或行动建议，单独列出。`,
+    `文档里没有的内容不要编造。`,
+    ``,
+    `文档：${name || '（未命名）'}${sizeText ? `（${sizeText}）` : ''}`,
+    `PDF 原文件见本消息附带的文件内容，请直接阅读。`,
+  ].join('\n');
+}
+
+// 双语 Markdown（一期定式）：## 小节标题 → 原文段落 → 译文。PDF 无文本层可切，
+// 不走网页翻译的分批协议，整文档一次流式输出
+export function buildPdfTranslatePrompt({ name, sizeText, targetLang = '简体中文' }) {
+  return [
+    `请把下面这份 PDF 文档完整翻译成${targetLang}，输出双语 Markdown：`,
+    `1. 按文档自身的章节结构组织输出：每一节一个小节，\`## 小节标题\`，先给该节原文，空一行后给「**译文**」与完整翻译；不得省略或合并任何小节；`,
+    `2. 代码、命令、路径、配置键值、代码标识符、URL、邮箱、数字与公式保持原样不翻译；`,
+    `3. 图片 / 图表位置用一行「（图：根据图中内容概括）」占位；表格保留结构、翻译单元格文字；`,
+    `4. 不要添加原文没有的内容，不要输出与翻译无关的解释。`,
+    ``,
+    `文档：${name || '（未命名）'}${sizeText ? `（${sizeText}）` : ''}`,
+    `PDF 原文件见本消息附带的文件内容，请直接阅读。`,
+  ].join('\n');
+}
+
+// >15MB（模型附件上限）翻译的 Agent 降级 prompt：字节已由知识库同步传到工作区，
+// 引导 agent 分段读 PDF、把双语成品写进 docs/，回复只给章节清单（不把全文贴进对话）
+export function buildPdfAgentPrompt({ name, wsPath, targetLang = '简体中文', outName = 'translation.md' }) {
+  return [
+    `请把工作区里的 PDF 文档 \`${wsPath || name}\`${name && wsPath && name !== wsPath ? `（${name}）` : ''} 完整翻译成${targetLang}，产出双语 Markdown 文件：`,
+    `1. 用 read_file 分段读取这份 PDF，直到读完整个文档（文件较大，注意接续上次的读取位置）；`,
+    `2. 按文档章节结构组织：每节 \`## 小节标题\`，原文段落在前、「**译文**」与完整翻译在后；代码 / 命令 / 数字 / 公式保持原样；不得省略小节；`,
+    `3. 把成品写入工作区 \`docs/${outName}\`（文档长可分多次追加，注意不要覆盖已写内容）；`,
+    `4. 完成后在回复里只给出章节清单与输出文件路径，不要把全文贴进回复。`,
+  ].join('\n');
+}
+
 // ---- 翻译批处理 ----
 
 export const TRANSLATE_BATCH_CHARS = 2400;
@@ -261,6 +303,15 @@ if (typeof process !== 'undefined' && process.argv[1] && process.argv[1].endsWit
   const VP = buildVideoFramesPrompt({ mode: 'analyze', count: 4, note: '时长约 60 秒' });
   assert('视频关键帧 prompt：帧数/顺序/注记', VP.includes('关键帧') && VP.includes('共 4 帧') && VP.includes('时长约 60 秒'));
   assert('视频提取 prompt：逐帧提文字', buildVideoFramesPrompt({ mode: 'extract', count: 3 }).includes('逐字提取'));
+
+  const PS = buildPdfSummaryPrompt({ name: 'deck.pdf', sizeText: '3.2 MB' });
+  assert('PDF 总结 prompt：文档名/大小/防编造', PS.includes('deck.pdf') && PS.includes('3.2 MB') && PS.includes('不要编造'));
+  const PT = buildPdfTranslatePrompt({ name: 'deck.pdf', sizeText: '3.2 MB', targetLang: '英文' });
+  assert('PDF 翻译 prompt：双语/目标语言/保真约束', PT.includes('英文') && PT.includes('双语 Markdown') && PT.includes('译文') && PT.includes('不得省略'));
+  assert('PDF 翻译 prompt：默认简体中文', buildPdfTranslatePrompt({ name: 'a.pdf' }).includes('简体中文'));
+  const PA = buildPdfAgentPrompt({ name: 'big.pdf', wsPath: 'knowledge/big.pdf', outName: 'big-trans.md' });
+  assert('PDF Agent prompt：工作区路径/输出文件/分段读', PA.includes('knowledge/big.pdf') && PA.includes('docs/big-trans.md') && PA.includes('read_file') && PA.includes('章节清单'));
+  assert('PDF Agent prompt：wsPath 缺省回退文件名', buildPdfAgentPrompt({ name: 'big.pdf' }).includes('big.pdf'));
 
   const items = [{ id: 'a', text: 'Hello world' }, { id: 'b', text: 'Goodbye' }];
   const tp = buildTranslateBatchPrompt({ items, targetLang: '中文' });

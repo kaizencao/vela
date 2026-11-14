@@ -318,7 +318,7 @@ $('#om-save').addEventListener('click', async () => {
       ...curSettings.chat,
       // 聊天顶栏切引擎也会写 defaultEngine：本页没动过就保留存储里的最新值
       defaultEngine: chatEngineTouched ? $('#om-chat-engine').value : curSettings.chat.defaultEngine,
-      toolMaxSteps: Math.min(50, Math.max(1, Number($('#om-chat-maxsteps').value || 12))),
+      toolMaxSteps: Math.min(200, Math.max(1, Number($('#om-chat-maxsteps').value || 12))),
     },
     translation: {
       targetLang: txLangTouched ? $('#om-tx-lang').value : curSettings.translation.targetLang,

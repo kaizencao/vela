@@ -3,11 +3,16 @@
 
 import { loadSettings, DEFAULT_QUICK_ACTIONS } from '../llm/store.js';
 import { DRAFT_KEY, DRAFT_MAX_PAGES, PAGE_CTX_MAX, pageKeyOf, addItem, removeItems, setPageText } from '../mindmap/draft.js';
+import { isPdfUrl, pdfNameFromUrl } from '../page/pdf-doc.js';
+import { pageToMarkdown } from '../content/injected.js';
 
 const MENU_ROOT = 'om-root';
 const MENU_CHAT_TAB = 'om-chat-tab';
 const MENU_TRANSLATE = 'om-translate-page';
 const MENU_READ_SERIES = 'om-read-series';
+const MENU_DOWNLOAD_MD = 'om-download-md';
+const MENU_PDF_SUM = 'om-pdf-sum';
+const MENU_PDF_TRANS = 'om-pdf-trans';
 const menuActionId = (actionId) => `om-qa:${actionId}`;
 
 async function rebuildMenus() {
@@ -26,6 +31,20 @@ async function rebuildMenus() {
   );
   chrome.contextMenus.create(
     { id: MENU_READ_SERIES, parentId: MENU_ROOT, title: '连读此文档（跟随下一页）', contexts: ['page'] },
+    () => void chrome.runtime.lastError,
+  );
+  chrome.contextMenus.create(
+    { id: MENU_DOWNLOAD_MD, parentId: MENU_ROOT, title: '下载此网页为 Markdown', contexts: ['page'] },
+    () => void chrome.runtime.lastError,
+  );
+  // PDF 链接入口（内建 PDF 查看器注入不了内容脚本，链接右键是 PDF 的一期主入口）。
+  // contextMenus 无法按链接目标过滤：所有链接右键都会显示，点击时非 PDF 静默忽略
+  chrome.contextMenus.create(
+    { id: MENU_PDF_SUM, title: 'Vela：总结此 PDF', contexts: ['link'] },
+    () => void chrome.runtime.lastError,
+  );
+  chrome.contextMenus.create(
+    { id: MENU_PDF_TRANS, title: 'Vela：翻译此 PDF', contexts: ['link'] },
     () => void chrome.runtime.lastError,
   );
   chrome.contextMenus.create(
@@ -230,6 +249,9 @@ async function handleWidgetAction(msg, tab) {
     await chrome.tabs.create({ url: chrome.runtime.getURL(`src/mindmap/mindmap.html#job=${jobId}`) });
     return { ok: true };
   }
+  if (msg.kind === 'download-md') {
+    return downloadMarkdown(tab);
+  }
   if (msg.kind === 'quick-action') {
     const qa = await resolveQuickAction(msg.actionId);
     if (!qa) return { ok: false };
@@ -269,9 +291,122 @@ async function openChatInTab(tab) {
   return 'tab';
 }
 
+// PDF 标签页 / PDF 链接 → 一次性任务写 storage.session，开独立聊天页按 hash 消费。
+// 内建 PDF 查看器（PDFium plugin 文档）注入不了任何内容脚本，浮窗 / 页内聊天卡两路都不通；
+// 聊天页里 fetch 字节 → 建知识库快照 → 跑 LLM，全在扩展页完成（流式不进 SW）。
+// 返回 false 表示不是 PDF（调用方落回原有路径）
+async function openPdfJob(tab, action) {
+  const url = tab?.url || '';
+  if (!isPdfUrl(url)) return false;
+  const jobId = `pdf-${Date.now().toString(36)}`;
+  await chrome.storage.session.set({
+    [`omPdfJob:${jobId}`]: {
+      v: 1,
+      url,
+      title: pdfNameFromUrl(url) || String(tab?.title || '').slice(0, 120),
+      action, // 'summary' 总结 | 'translate' 翻译 | 'chat' 分析
+      ts: Date.now(),
+    },
+  });
+  await chrome.tabs.create({ url: chrome.runtime.getURL(`src/chatpage/chat.html#pdf=${jobId}`) });
+  return true;
+}
+
+// ---- 网页下载为 Markdown ----
+// 编排全在 SW：executeScript 注入 injected.js 的 pageToMarkdown 原样转换（自包含函数），
+// 拿到 md 后交离屏文档造 Blob 落盘。SW 不能 URL.createObjectURL，data: URL 有 ~2MB 上限，
+// chrome.offscreen 是官方给 blob 下载留的通道（minimum_chrome_version 116 > 109，可用）。
+
+// 文件名：<页面标题>.md。safeFilename（browser-tools.js）同规则就地内联——那是页面模块，SW 不 import
+function mdFilename(title) {
+  const safe = String(title || '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .replace(/^[. ]+|[. ]+$/g, '').slice(0, 80).trim();
+  return `${safe || 'page'}.md`;
+}
+
+async function ensureOffscreen() {
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (contexts.length) return;
+  await chrome.offscreen.createDocument({
+    url: 'src/page/offscreen.html',
+    reasons: ['BLOBS'],
+    justification: '把网页 Markdown 经 Blob 落盘下载（SW 不能 createObjectURL）',
+  });
+}
+
+// 在途下载计数：归零后延时关文档，避免连续下载每次都建/关一轮（createDocument 有冷启动开销）
+let offscreenBusy = 0;
+
+// createDocument 返回时离屏模块脚本可能还没挂上 onMessage（报 Receiving end does not exist）：
+// 轮询重发直到送达（上限约 3s）。只对「未送达」类错误重试——「message port closed」说明已送达
+// 只是没等到回执，重发会触发第二次下载，直接抛给上层按失败处理。
+async function sendOffscreen(msg) {
+  for (let i = 0; i < 12; i++) {
+    try {
+      return await chrome.runtime.sendMessage(msg);
+    } catch (e) {
+      const text = e?.message || String(e);
+      if (!/Receiving end does not exist/i.test(text)) throw e;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+  throw new Error('离屏文档未就绪');
+}
+
+// 离屏锚点点击后立即回执；落定由 SW 查 downloads 记录确认（blob URL 精确匹配），250ms × 120 ≈ 30s
+async function waitDownloadDone(url) {
+  for (let i = 0; i < 120; i++) {
+    const list = await chrome.downloads.search({ url }).catch(() => []);
+    const rec = list[0];
+    if (rec && (rec.state === 'complete' || rec.state === 'interrupted')) {
+      return rec.state === 'complete' ? { ok: true } : { ok: false, error: rec.error || '下载中断' };
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return { ok: false, error: '下载超时' };
+}
+
+async function downloadViaOffscreen(content, filename) {
+  await ensureOffscreen();
+  offscreenBusy += 1;
+  try {
+    return await Promise.race([
+      (async () => {
+        const res = await sendOffscreen({ type: 'om:offscreen-download', content, filename });
+        if (!res?.ok) return res ?? { ok: false, error: '离屏文档无回执' };
+        return waitDownloadDone(res.url);
+      })(),
+      new Promise((r) => setTimeout(() => r({ ok: false, error: '下载超时' }), 30000)),
+    ]);
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  } finally {
+    offscreenBusy -= 1;
+    setTimeout(() => {
+      if (offscreenBusy <= 0) chrome.offscreen.closeDocument().catch(() => { /* 已关或不存在 */ });
+    }, 15000);
+  }
+}
+
+// 入口（右键菜单 / 浮窗「下载 MD」钮）都汇到这里。不可注入或空内容返回 { ok:false }：
+// 菜单侧静默忽略，浮窗侧据此亮「动作失败」提示
+async function downloadMarkdown(tab) {
+  if (!tab?.id || !/^https?:/i.test(tab.url || '')) return { ok: false };
+  let first;
+  try {
+    [first] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: pageToMarkdown });
+  } catch {
+    return { ok: false }; // PDF / chrome:// 等页面注入不了：静默
+  }
+  const { title, md } = first?.result || {};
+  if (!md || !String(md).trim()) return { ok: false };
+  return downloadViaOffscreen(String(md), mdFilename(title));
+}
+
 // 工具栏图标 / Ctrl+M（_execute_action）：开关当前标签页的页内聊天卡；
-// 无浮窗页面（chrome:// 新标签页等）回落独立聊天页标签。
+// PDF 页默认发起总结（注入不了浮窗）；无浮窗页面（chrome:// 新标签页等）回落独立聊天页标签。
 chrome.action.onClicked.addListener(async (tab) => {
+  if (await openPdfJob(tab, 'summary')) return;
   if (!(await messageWidget(tab, { type: 'om:toggle-card' }))) {
     await chrome.tabs.create({ url: chrome.runtime.getURL('src/chatpage/chat.html') });
   }
@@ -282,7 +417,12 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     chrome.tabs.create({ url: chrome.runtime.getURL('src/chatpage/chat.html') });
     return;
   }
+  if (info.menuItemId === MENU_PDF_SUM || info.menuItemId === MENU_PDF_TRANS) {
+    await openPdfJob({ url: info.linkUrl || '' }, info.menuItemId === MENU_PDF_TRANS ? 'translate' : 'summary');
+    return; // 非 PDF 链接：静默忽略（菜单无法按目标过滤）
+  }
   if (info.menuItemId === MENU_TRANSLATE) {
+    if (await openPdfJob(tab, 'translate')) return; // PDF 页没有可注入的正文：转整份文档管线
     await openChatInTab(tab); // 先开聊天界面再写任务，界面加载后经 onChanged 消费
     await chrome.storage.session.set({
       pendingTask: { kind: 'translate-page', tabId: tab?.id ?? null, ts: Date.now() },
@@ -290,10 +430,15 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     return;
   }
   if (info.menuItemId === MENU_READ_SERIES) {
+    if (await openPdfJob(tab, 'summary')) return; // PDF 没有「下一页」可跟：连读退化为总结
     await openChatInTab(tab);
     await chrome.storage.session.set({
       pendingTask: { kind: 'read-series', tabId: tab?.id ?? null, ts: Date.now() },
     });
+    return;
+  }
+  if (info.menuItemId === MENU_DOWNLOAD_MD) {
+    await downloadMarkdown(tab); // 不可注入页面（PDF 等）静默失败，与 PDF 链接菜单同约定
     return;
   }
   if (typeof info.menuItemId === 'string' && info.menuItemId.startsWith('om-qa:')) {

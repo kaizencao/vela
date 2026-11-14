@@ -26,6 +26,31 @@
 
   const HOST_ID = 'om-widget-host';
 
+  // ---------- 本页暂停（胶囊右上角暂停钮，跑浏览器自动化前点） ----------
+  // 浮窗悬停展开/收起、媒体悬停钮、划词工具条都在持续动 DOM，快照式自动化
+  // （snapshot → 按 ref 点击）在同步与点击之间被改 DOM 就会点错。sessionStorage
+  // 按标签页记忆：整页跳转（自动化换页）不复活，关标签页自然清空；同址重载
+  // （刷新，含前进/后退回到暂停时的地址）视为用户回来，注入时清标记恢复。
+  // 划词工具条（selection-popup.js，同 world、注册序在后）只读同一 key 判停。
+  const PAUSE_KEY = 'om-page-paused';
+  const pageKeyNow = () => location.origin + location.pathname + location.search;
+  const pauseState = () => {
+    try {
+      const st = JSON.parse(sessionStorage.getItem(PAUSE_KEY) || 'null');
+      return st && st.u ? st : null;
+    } catch { return null; }
+  };
+  // 注入时判定：记的地址 == 当前地址 = 同址重载，清标记恢复；换页来的保持暂停
+  const consumePause = () => {
+    const st = pauseState();
+    if (st && st.u === pageKeyNow()) {
+      try { sessionStorage.removeItem(PAUSE_KEY); } catch { /* 沙箱页 storage 只读 */ }
+    }
+    return !!pauseState();
+  };
+  // 运行中判停（暂停可在会话中途点下）：只读，不碰同址清除逻辑
+  const pagePaused = () => !!pauseState();
+
   // 与 shell.js ICONS 同风格的原创线性图标
   const ICONS = {
     doc: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/>',
@@ -34,11 +59,14 @@
     // 船帆 logo：与 src/ui/brand.js 同一组路径（内容脚本禁 import，手抄；改那里要同步改这里）
     logo: '<path d="M11.2 3.2 C15.6 6.6 18.3 11 18.8 15.8 L11.2 15.8 Z" fill="currentColor" stroke="none"/><path d="M9.6 6.4 L9.6 15.8 L4.4 15.8 C5.6 12.2 7.3 9 9.6 6.4 Z" fill="currentColor" stroke="none"/><path d="M3.4 17.4 L20.6 17.4 C19.7 19.7 17.7 21 15.3 21 L8.7 21 C6.3 21 4.3 19.7 3.4 17.4 Z" fill="currentColor" stroke="none"/><path d="M19.6 1.6 L20.15 3.35 L21.9 3.9 L20.15 4.45 L19.6 6.2 L19.05 4.45 L17.3 3.9 L19.05 3.35 Z" fill="currentColor" stroke="none"/>',
     close: '<path d="M6 6l12 12M18 6L6 18"/>',
+    pause: '<path d="M9 5v14M15 5v14"/>',
     media: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.6"/><path d="M21 15.5l-4.5-4.5-6 6L7 13.5l-4 4"/>',
     // 思维导图：中心节点分三支
     mind: '<circle cx="5" cy="12" r="2.1"/><circle cx="17" cy="6" r="2.1"/><circle cx="17" cy="12" r="2.1"/><circle cx="17" cy="18" r="2.1"/><path d="M7.1 12h2.4M9.5 6v12M9.5 6h5.4M9.5 12h5.4M9.5 18h5.4"/>',
     // 连续阅读：一叠往后翻的文档页
     pages: '<rect x="9" y="3" width="11" height="13" rx="1.5"/><path d="M15 20H5.5A1.5 1.5 0 0 1 4 18.5V7"/><path d="M12 7h5M12 11h5"/><path d="M7 11l-1.5 3.5h3L7 18"/>',
+    // 下载：竖线入托盘
+    download: '<path d="M12 3v11"/><path d="M7 10l5 5 5-5"/><path d="M4.5 20h15"/>',
     gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
   };
 
@@ -133,10 +161,14 @@
     } catch {
       throw new Error('extension context unavailable');
     }
-    // 本标签页上次打开的会话（聊天卡上报存 sessionStorage）：带 ?conv= 恢复，标签页各自独立
+    // 本标签页上次打开的会话（聊天卡上报存 sessionStorage）：带 ?conv= 恢复，标签页各自独立。
+    // 另带宿主页地址与标题（?page=/?pt=）：卡片按页绑定会话——每个网页开卡都是自己的会话，
+    // 不会串到别的页面最近聊过的那个
     let remembered = '';
     try { remembered = sessionStorage.getItem('om-card-conv') || ''; } catch { /* 页面禁用存储时忽略 */ }
-    const cardUrl = remembered ? `${url}?conv=${encodeURIComponent(remembered)}` : url;
+    const sep = remembered ? '&' : '?';
+    const cardUrl = `${url}${remembered ? `?conv=${encodeURIComponent(remembered)}` : ''}`
+      + `${sep}page=${encodeURIComponent(location.href)}&pt=${encodeURIComponent(String(document.title || '').trim().slice(0, 60))}`;
     const host = document.createElement('div');
     host.id = CARD_ID;
     // 贴右满高（对齐原生侧边栏形态）：浮窗列同步左移让位
@@ -335,6 +367,7 @@
 
   // mouseover 在 document 上连续触发即连续跟踪：命中媒体元素→亮钮；命中钮/弹层→按未离开；其余→宽限后收起
   document.addEventListener('mouseover', (ev) => {
+    if (pagePaused()) return; // 本页暂停：不再长出媒体悬停钮
     const onUi = ev.target === hoverBtnHost() || ev.target === hoverPopHost();
     const t = onUi ? null : mediaTargetOf(ev.target);
     if (t) {
@@ -705,7 +738,19 @@
     root.innerHTML = `
       <style>
         :host { all: initial; }
-        .stack { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+        /* 默认收起为悬浮球：动作列（.stack）隐藏，.om-ball 可见；展开后互换位置 */
+        .stack { display: none; flex-direction: column; align-items: center; gap: 8px; }
+        .stack.open { display: flex; animation: om-pop-in .15s ease; }
+        .om-ball {
+          width: 40px; height: 40px; border-radius: 50%; border: none; cursor: grab;
+          background: #6841ea; color: #fff; display: flex; align-items: center; justify-content: center;
+          box-shadow: 0 4px 14px rgba(68,44,180,.36); padding: 0;
+          transition: transform .12s ease;
+          user-select: none; -webkit-user-select: none;
+        }
+        .om-ball.dragging { cursor: grabbing; transition: none; }
+        .om-ball:hover { transform: scale(1.06); }
+        .om-ball.hide { display: none; }
         .act {
           position: relative;
           width: 36px; height: 36px; border-radius: 50%; border: none; cursor: pointer;
@@ -737,6 +782,34 @@
           box-shadow: 0 2px 6px rgba(0,0,0,.3);
         }
         .dismiss:hover { background: #55565e; }
+        .pause {
+          position: absolute; top: -6px; right: -6px; width: 16px; height: 16px;
+          border-radius: 50%; cursor: pointer;
+          background: #3a3b41; color: #fff; display: flex; align-items: center; justify-content: center;
+          box-shadow: 0 2px 6px rgba(0,0,0,.3);
+        }
+        .pause:hover { background: #b3261e; }
+        .pill.dragging { cursor: grabbing; transition: none; }
+        /* 暂停确认卡：点 ⏸ 先说明作用再执行（光靠 title 悬停提示没人看得懂） */
+        .om-w-confirm {
+          position: absolute; right: 46px; top: 50%; transform: translateY(-50%);
+          width: 218px; background: #212227; color: #fff; border-radius: 12px;
+          padding: 12px 14px; box-shadow: 0 10px 32px rgba(0,0,0,.38);
+          font: 12px/1.5 system-ui, "Segoe UI", sans-serif;
+          animation: om-pop-in .15s ease;
+        }
+        .om-w-confirm[hidden] { display: none; }
+        .om-w-confirm-title { font-weight: 600; font-size: 13px; margin-bottom: 5px; }
+        .om-w-confirm-body { color: rgba(255,255,255,.78); margin-bottom: 10px; }
+        .om-w-confirm-btns { display: flex; gap: 8px; justify-content: flex-end; }
+        .om-w-confirm-btns button {
+          border: none; border-radius: 7px; padding: 5px 12px; cursor: pointer;
+          font: 600 12px/1.4 system-ui, sans-serif; color: #fff;
+        }
+        .om-w-confirm-ok { background: #b3261e; }
+        .om-w-confirm-ok:hover { background: #c93a30; }
+        .om-w-confirm-no { background: #3a3b41; }
+        .om-w-confirm-no:hover { background: #55565e; }
         .om-w-hint {
           position: absolute; right: 44px; top: 50%; transform: translateY(-50%);
           background: #212227; color: #fff; font: 12px/1.4 system-ui, sans-serif;
@@ -794,26 +867,152 @@
         }
         .pill.on { background: #5a35d0; box-shadow: 0 6px 18px rgba(68,44,180,.55); }
       </style>
+      <button class="om-ball" title="Vela AI 助手（悬停展开菜单，按住可上下拖动）"></button>
       <div class="stack">
         <button class="act" data-act="page-summary" title="总结此页"></button>
         <button class="act" data-act="translate-page" title="翻译此页"></button>
         <button class="act" data-act="quick-action" title="解释选中文字"></button>
         <button class="act" data-act="mindmap" title="本页思维导图：划词高亮素材 / 整页正文生成导图（无需选中文字）"></button>
         <button class="act" data-act="read-series" title="连续阅读：从本页开始自动跟随「下一页」链接，逐页读完这组文档并汇总"></button>
-        <button class="pill" data-act="open-panel" title="展开 / 收起本页聊天卡">
+        <button class="act" data-act="download-md" title="下载此网页为 Markdown（.md 原样保存页面内容）"></button>
+        <button class="pill" data-act="open-panel" title="展开 / 收起聊天卡，按住胶囊可上下拖动">
           <span class="logo"></span><span>AI 助手</span>
           <span class="dismiss" role="button" title="隐藏浮窗（刷新页面后恢复）"></span>
+          <span class="pause" role="button" title="暂停本页 Vela：停用浮窗 / 划词工具条 / 媒体悬停钮，给网页自动化让路"></span>
         </button>
         <div class="om-w-hint"></div>
+      </div>
+      <div class="om-w-confirm" hidden>
+        <div class="om-w-confirm-title">暂停本页 Vela？</div>
+        <div class="om-w-confirm-body">停用浮窗、划词工具条与媒体悬停钮，给网页自动化让路；换页保持暂停，刷新本页恢复。</div>
+        <div class="om-w-confirm-btns">
+          <button class="om-w-confirm-ok">暂停本页</button>
+          <button class="om-w-confirm-no">取消</button>
+        </div>
       </div>`;
     root.querySelector('[data-act="page-summary"]').appendChild(svg('doc', 17));
     root.querySelector('[data-act="translate-page"]').appendChild(svg('translate', 17));
     root.querySelector('[data-act="quick-action"]').appendChild(svg('explain', 17));
     root.querySelector('[data-act="mindmap"]').appendChild(svg('mind', 17));
     root.querySelector('[data-act="read-series"]').appendChild(svg('pages', 17));
+    root.querySelector('[data-act="download-md"]').appendChild(svg('download', 17));
     root.querySelector('.pill .logo').appendChild(svg('logo', 16));
     root.querySelector('.dismiss').appendChild(svg('close', 9));
+    root.querySelector('.pause').appendChild(svg('pause', 9));
+    root.querySelector('.om-ball').appendChild(svg('logo', 20));
     pillEl = root.querySelector('.pill');
+
+    // 悬浮球 ↔ 动作列互换：注入后默认收起（球 40×40，占位从整列缩到一颗球）。
+    // 悬停 180ms 展开（略过快速划过），移开 300ms 收起；点球立即展开（触屏兜底）。
+    // 聊天卡开着或翻译设置弹层开着时常开——胶囊关卡入口 / 弹层关闭钮都在列侧，收掉就够不着了；
+    // 点击 host 外收起（pin 时不收）。
+    const ballEl = root.querySelector('.om-ball');
+    const stackEl = root.querySelector('.stack');
+    let ballShowT = 0, ballHideT = 0;
+    const stackOpen = () => stackEl.classList.contains('open');
+    const setStack = (open) => {
+      stackEl.classList.toggle('open', open);
+      ballEl.classList.toggle('hide', open);
+    };
+    const confirmEl = root.querySelector('.om-w-confirm');
+    const confirmOpen = () => !confirmEl.hasAttribute('hidden');
+    const stackPinned = () => chatCardOpen() || !!popEl || confirmOpen();
+    host.addEventListener('mouseenter', () => {
+      clearTimeout(ballHideT);
+      if (stackOpen() || stackPinned()) return;
+      clearTimeout(ballShowT);
+      ballShowT = setTimeout(() => { if (!dragging) setStack(true); }, 180); // 按住球未动时定时器别把球换掉
+    });
+    host.addEventListener('mouseleave', () => {
+      clearTimeout(ballShowT);
+      if (dragging) return; // 拖动途中指针扫出 host 不收起（松手时统一处置）
+      if (!stackOpen()) return;
+      clearTimeout(ballHideT);
+      ballHideT = setTimeout(() => { if (!stackPinned()) setStack(false); }, 300);
+    });
+    ballEl.addEventListener('click', () => {
+      if (dragClickSuppressed) return; // 拖动收尾的合成 click 不展开
+      clearTimeout(ballShowT);
+      clearTimeout(ballHideT);
+      setStack(true);
+    });
+
+    // 上下拖动换位：收起态按住悬浮球、展开态按住胶囊本体（角上的隐藏/暂停钮除外）
+    // 都能拖——悬停 180ms 就展开动作列，球态几乎按不到，只绑球等于没有拖动。
+    // 锚点（host.style.top，配合 translateY(-50%) 中心对位）经 chrome.storage.local
+    // 跨页记忆，所有页面注入后还原同一位置。位移超 4px 才算拖动——否则按悬停/点击
+    // 语义走；拖完吞掉紧随的合成 click，球不弹开、胶囊不误开聊天卡
+    const POS_KEY = 'om-widget-pos';
+    let dragClickSuppressed = false;
+    let dragging = false, dragFromPill = false, dragMoved = false, dragStartY = 0, dragAnchor = 0;
+    const clampAnchor = (y) => Math.max(60, Math.min(window.innerHeight - 60, y));
+    const applyAnchor = (y) => { host.style.top = `${clampAnchor(y)}px`; };
+    // 锚点 = host 中心（translateY(-50%) 中心对位）。默认态 style.top 是 '38%'，
+    // parseFloat 会得出 38px 的错值——未固化为 px 时一律按几何位置算
+    const anchorY = () => {
+      const t = parseFloat(host.style.top);
+      if (Number.isFinite(t) && /px$/.test(host.style.top)) return t;
+      const r = host.getBoundingClientRect();
+      return r.top + r.height / 2;
+    };
+    try {
+      chrome.storage.local.get(POS_KEY).then(({ [POS_KEY]: v }) => {
+        if (v && Number.isFinite(v.y)) applyAnchor(v.y);
+      }).catch(() => { /* 读不到就用默认 38% */ });
+    } catch { /* 上下文失效：跳过记忆位置 */ }
+    const startDrag = (e, fromPill) => {
+      if (e.button !== 0) return;
+      dragging = true;
+      dragFromPill = fromPill;
+      dragMoved = false;
+      dragStartY = e.clientY;
+      dragAnchor = anchorY();
+    };
+    ballEl.addEventListener('mousedown', (e) => startDrag(e, false));
+    pillEl.addEventListener('mousedown', (e) => {
+      if (e.target.closest('.dismiss, .pause')) return; // 角上的隐藏/暂停钮不吃拖动
+      startDrag(e, true);
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const dy = e.clientY - dragStartY;
+      if (!dragMoved && Math.abs(dy) < 4) return;
+      dragMoved = true;
+      clearTimeout(ballShowT); // 按住拖动不展开动作列
+      clearTimeout(ballHideT); // 展开态拖动不收起
+      (dragFromPill ? pillEl : ballEl).classList.add('dragging');
+      applyAnchor(dragAnchor + dy);
+      e.preventDefault(); // 拖动不该选中页面文字
+    });
+    document.addEventListener('mouseup', (e) => {
+      if (!dragging) return;
+      dragging = false;
+      ballEl.classList.remove('dragging');
+      pillEl.classList.remove('dragging');
+      if (!dragMoved) return;
+      dragClickSuppressed = true;
+      setTimeout(() => { dragClickSuppressed = false; }, 0);
+      // 拖动途中 mouseleave 被吞：松手时指针已离开 host 才安排收起（在列上松手保持展开）
+      if (dragFromPill && !host.contains(e.target)) {
+        ballHideT = setTimeout(() => { if (!stackPinned()) setStack(false); }, 300);
+      }
+      try {
+        chrome.storage.local.set({ [POS_KEY]: { y: clampAnchor(anchorY()) } });
+      } catch { /* 上下文失效：本次会话内仍生效 */ }
+    });
+    // 窗口变矮时把已固化的记忆锚点拉回视口内（默认 38% 态不固化，交给 CSS）
+    window.addEventListener('resize', () => {
+      if (host.isConnected && /px$/.test(host.style.top)) applyAnchor(parseFloat(host.style.top));
+    });
+    document.addEventListener('click', (e) => {
+      if (e.composedPath().includes(host)) return;
+      if (dragClickSuppressed) return; // 拖动收尾的合成 click 不收起
+      if (confirmOpen()) closeConfirm();
+      if (!stackOpen() || stackPinned()) return;
+      clearTimeout(ballShowT);
+      clearTimeout(ballHideT);
+      setStack(false);
+    }, true);
 
     // 胶囊：就地开关页内聊天卡（无需 SW 参与，旧上下文失效也能开合）
     // 一次性动作（总结/解释）：sendMessage 交 SW 写 pendingTask，同时打开聊天卡即时执行。
@@ -829,6 +1028,7 @@
         : '扩展未响应：请到 chrome://extensions 刷新 Vela，并刷新本页重试');
     };
     root.querySelector('.stack').addEventListener('click', async (e) => {
+      if (dragClickSuppressed) return; // 拖动收尾的合成 click 不触发动作
       const btn = e.target.closest('button');
       if (!btn || btn.classList.contains('dismiss')) return;
       if (btn.dataset.act === 'open-panel') {
@@ -840,6 +1040,21 @@
         busyBtn = btn;
         btn.classList.add('active');
         send({ type: 'om:widget-action', kind: 'mindmap', from: 'widget', pageText: snapshotPageText() }, onActionRes);
+        return;
+      }
+      // 下载此页为 Markdown：页面内原样转换（injected.js pageToMarkdown）+ SW 经离屏文档落盘，
+      // 不开聊天卡。失败提示比通用文案更具体（多数是页面注入不了或正文为空）
+      if (btn.dataset.act === 'download-md') {
+        busyBtn = btn;
+        btn.classList.add('active');
+        send({ type: 'om:widget-action', kind: 'download-md', from: 'widget' }, (res) => {
+          const b = busyBtn;
+          busyBtn = null;
+          b?.classList.remove('active');
+          if (res && res.ok) return;
+          if (res?.error) console.warn('[om] download-md 失败：', res.error);
+          hint(root, res ? '本页无法转存（页面不可注入或内容为空）' : '扩展未响应：请到 chrome://extensions 刷新 Vela，并刷新本页重试');
+        });
         return;
       }
       // 翻译按钮是开关（Monica 式）：已翻译再点 = 还原原文并撤掉编排。
@@ -895,6 +1110,38 @@
       host.remove();
       closeChatCard();
       closeHoverPop();
+    });
+    // 暂停本页：为浏览器自动化让路。除本浮窗外，同 world 的划词工具条/代码/高亮钮、
+    // 媒体悬停钮与弹层一并摘掉；媒体 mouseover 与 selection-popup 的 show 按标记判停。
+    // sessionStorage 按标签页记：换页保持暂停，刷新同址（回到暂停时的地址）恢复。
+    // 点 ⏸ 先弹确认卡说明作用（title 悬停提示太隐蔽，用户不知道这钮干嘛的），确认才执行
+    const closeConfirm = () => {
+      // 收卡后若指针不在 host 上，安排动作列照常收起（指针移回会被 mouseenter 清掉定时器）
+      if (confirmOpen()) ballHideT = setTimeout(() => { if (!stackPinned()) setStack(false); }, 300);
+      confirmEl.setAttribute('hidden', '');
+    };
+    const doPause = () => {
+      try { sessionStorage.setItem(PAUSE_KEY, JSON.stringify({ u: pageKeyNow() })); } catch { /* 存不了也收：仅本次文档生效 */ }
+      host.remove();
+      closeChatCard();
+      closeHoverPop();
+      document.getElementById(HOVER_BTN_ID)?.remove();
+      document.getElementById('om-media-pop')?.remove();
+      for (const id of ['om-sel-host', 'om-sel-panel-host', 'om-sel-cbtn-host', 'om-sel-hlbtn-host']) {
+        document.getElementById(id)?.remove();
+      }
+      console.info('[Vela] 本页已暂停：浮窗 / 媒体悬停钮 / 划词工具条已停用；换页保持暂停，刷新本页恢复');
+    };
+    root.querySelector('.pause').addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (confirmOpen()) { closeConfirm(); return; }
+      confirmEl.removeAttribute('hidden');
+      document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeConfirm(); }, { once: true });
+    });
+    confirmEl.querySelector('.om-w-confirm-ok').addEventListener('click', () => doPause());
+    confirmEl.querySelector('.om-w-confirm-no').addEventListener('click', (e) => {
+      e.stopPropagation();
+      closeConfirm();
     });
 
     // 翻译进行中让位给浮球（bridge 广播，旧版 bridge 只有这一条）
@@ -1000,5 +1247,11 @@
     console.info(`[Vela] 页面浮窗已注入 v${chrome.runtime.getManifest().version}`);
   }
 
-  build();
+  // 本页暂停中（上一文档点的暂停、整页跳转过来的）：不铺浮窗；媒体 mouseover
+  // 已按标记判停。同址重载在 consumePause 里清标记，刷新即恢复
+  if (consumePause()) {
+    console.info('[Vela] 本页已暂停：浮窗 / 媒体悬停钮 / 划词工具条停用中（刷新本页恢复）');
+  } else {
+    build();
+  }
 })();

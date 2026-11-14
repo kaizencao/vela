@@ -213,11 +213,12 @@ try {
   check('刷新页面后知识库句柄仍可读', /README-MARKER/.test(rd), rd.slice(0, 150));
 
   // ---- 6. LLM 问答：授权单个文件 → 内容附进上下文；文件夹提示切任务模式 ----
+  // 引擎切换一律原地换（PDF 管线依赖）：本会话已有 agent 轮次与知识库，切问答后原会话继续
   await E(`(() => { const s = document.getElementById('om-engine'); s.value = 'llm'; s.dispatchEvent(new Event('change')); return 1; })()`);
   await sleep(500);
   await grant('grant-file');
   conv = (await store())[0];
-  check('授权文件写入新对话知识库', conv.knowledge?.[0]?.handleKind === 'file' && conv.knowledge[0].name === 'README.md', conv.knowledge);
+  check('原地切问答后授权文件写入会话知识库', !!conv.knowledge?.some((k) => k.handleKind === 'file' && k.name === 'README.md'), conv.knowledge);
   const n1 = mock.requests.length;
   await send('总结一下');
   const qa = await waitAnswer(/问答回答/, 1);
@@ -287,22 +288,24 @@ try {
   await card.evaluate(`document.querySelector('.om-llm-perm .om-perm-allow').click()`);
   const sw2 = await waitSnap(snapA, /改结果：/, 2);
   check('快照只读：write_file 审批后明确报错、原内容不变', /只读/.test(sw2) && !/覆盖内容/.test(sw2), sw2.slice(0, 250));
-  // 有消息的会话切引擎会新建对话（不带原知识库）：新对话里再降级添加一次快照，走问答附带
+  // 引擎切换一律原地换：有消息的会话切问答不新建对话、知识库保留；同名快照再授权去重出（2），问答附带进 system 不带工具
   await card.evaluate(`(() => { const s = document.getElementById('om-engine'); s.value = 'llm'; s.dispatchEvent(new Event('change')); return 1; })()`);
   await sleep(500);
   await cardGrantFile();
   const snapB = await cardConvId();
-  const snapBEntry = (await store()).find((c) => c.id === snapB)?.knowledge?.find((k) => k.kind === 'snapshot');
+  check('原地切问答不新建对话（会话与知识库保留）', snapB === snapA, `${snapA} → ${snapB}`);
+  // 存储条目 name 不变，loadRoots 解析时才给同名显示名加（2）；wsPath 去重出 -2 后缀
+  const snapBEntry = (await store()).find((c) => c.id === snapB)?.knowledge?.find((k) => k.kind === 'snapshot' && k.wsPath === 'knowledge/snap-note.md-2');
   const n2 = mock.requests.length;
   await cardSend('总结一下');
-  const qa2 = await waitSnap(snapB, /问答回答/, 1);
-  check('切问答引擎新建对话后快照可再添加，且附进 system 不带工具', !!snapBEntry && snapB !== snapA && /SNAP-FILE-MARKER/.test(qa2) && mock.requests[n2]?.tools.length === 0, qa2.slice(0, 250));
+  const qa2 = await waitSnap(snapB, /问答回答/, 3);
+  check('原地切问答后快照可再添加，附进 system 不带工具', !!snapBEntry && /SNAP-FILE-MARKER/.test(qa2) && mock.requests[n2]?.tools.length === 0, qa2.slice(0, 250));
   // 重载宿主页：卡片按 ?conv= 恢复会话，IndexedDB 里的快照副本仍可读（问答再答一次）
   card.close();
   card = await openCard(snapB);
   const n3 = mock.requests.length;
   await cardSend('再总结一遍');
-  const qa3 = await waitSnap(snapB, /问答回答/, 2);
+  const qa3 = await waitSnap(snapB, /问答回答/, 4);
   check('重载后快照仍可读（IndexedDB 副本持久）', /SNAP-FILE-MARKER/.test(qa3) && mock.requests[n3]?.tools.length === 0, qa3.slice(0, 250));
   card.close();
   host.close();

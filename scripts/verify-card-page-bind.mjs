@@ -18,7 +18,10 @@ const FILL = '内容填充'.repeat(30);
 const page = (title, marker) => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body><article><h1>${title}</h1><p>${marker} ${FILL}</p></article></body></html>`;
 const PAGES = { '/a': ['Page A', 'PAGE-A-MARKER'], '/b': ['Page B', 'PAGE-B-MARKER'], '/legacy': ['Legacy Page', 'LEGACY-MARKER'] };
 const web = createServer((q, r) => {
-  const p = PAGES[q.url.split('?')[0]] || ['Page X', 'PAGE-X-MARKER'];
+  // /a?v=2 返回 V2 正文：页身份键不含 query，正文漂移要能刷新上下文（§8 断言用）
+  const path = q.url.split('?')[0];
+  const p = path === '/a' && q.url.includes('v=2') ? ['Page A V2', 'PAGE-A-V2-MARKER']
+    : (PAGES[path] || ['Page X', 'PAGE-X-MARKER']);
   r.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   r.end(page(...p));
 });
@@ -50,9 +53,16 @@ try {
   const swDo = async (expr) => { const s = await browser.sw(); const r = await s.evaluate(expr); s.close(); return r; };
   const tabAction = (urlPrefix, type) => swDo(`chrome.tabs.query({}).then((ts) => { const t = ts.find((x) => (x.url || '').startsWith(${JSON.stringify(urlPrefix)})); return chrome.tabs.sendMessage(t.id, { type: ${JSON.stringify(type)} }); }).then(() => 'ok')`);
   const seenFrames = new Set();
+  // 收起（om:close-card）现在只隐藏不销毁：重开同一标签页的卡连回原 iframe（无新 target）。
+  // 优先等新 target（新标签页开卡），4 秒没有再按宿主页参数匹配已有 target（收起复活）
   const openCard = async (urlPrefix) => {
+    const before = new Set((await browser.targets()).map((x) => x.id));
     await tabAction(urlPrefix, 'om:open-card');
-    const t = await waitFor(async () => (await browser.targets()).find((x) => x.type === 'iframe' && x.url.includes('/src/sidepanel/sidepanel.html') && !seenFrames.has(x.id)), { timeout: 12000 });
+    const cardT = (ts) => ts.filter((x) => x.type === 'iframe' && x.url.includes('/src/sidepanel/sidepanel.html'));
+    let t = await waitFor(async () => cardT(await browser.targets()).find((x) => !before.has(x.id)), { timeout: 4000 }).catch(() => null);
+    if (!t) {
+      t = await waitFor(async () => cardT(await browser.targets()).find((x) => { try { return decodeURIComponent(x.url).includes(urlPrefix); } catch { return false; } }), { timeout: 12000 });
+    }
     seenFrames.add(t.id);
     const s = await connect(t.webSocketDebuggerUrl);
     await s.send('Runtime.enable');
@@ -171,6 +181,36 @@ try {
   convs = await store();
   const slowAns = convs.flatMap((c) => c.items).find((i) => i.type === 'answer' && (i.content || '').includes('SLOW-STREAM-MARKER'));
   check('已流出内容已落盘（尾部不丢）', !!slowAns && (slowAns.content || '').length > 0, `len=${slowAns?.content?.length ?? 0}`);
+
+  // ---- 8. 同页 query 漂移（用户报障：刷新 / 收起重开新建了会话）：续原会话，正文变了上下文跟着刷新 ----
+  const convsN = (await store()).length;
+  const tabD = await browser.openTab(`${BASE}/a?v=1`, { wait: 2200 });
+  await tabD.send('Page.bringToFront');
+  const cardD = await openCard(`${BASE}/a?v=1`);
+  await sleep(1500);
+  convs = await store();
+  check('query 漂移后开卡：续 A 的会话（不新建）', convs.length === convsN && (await activeConv(cardD)) === convA.id, convs.map((c) => [c.title, c.pageKey]));
+  await tabAction(`${BASE}/a?v=1`, 'om:close-card');
+  cardD.close();
+  await sleep(400);
+  // 真刷新到 v=2 正文后重开：仍是 A 的会话，且网页上下文已换成 V2 正文
+  const tD = (await browser.targets()).find((t) => t.type === 'page' && t.url.startsWith(`${BASE}/a`));
+  const sD = await connect(tD.webSocketDebuggerUrl);
+  await sD.send('Runtime.enable');
+  await sD.evaluate(`history.replaceState({}, '', '?v=2')`);
+  await sD.send('Page.reload');
+  await sleep(2500);
+  sD.close();
+  const cardD2 = await openCard(`${BASE}/a?v=2`);
+  await sleep(1500);
+  convs = await store();
+  check('漂移+刷新后重开卡：仍续 A 的会话（不新建）', convs.length === convsN && (await activeConv(cardD2)) === convA.id, convs.map((c) => [c.title, c.pageKey]));
+  const nR = mock.requests.length;
+  await sendMsg(cardD2, 'A 页再问一句');
+  const reqD = mock.requests[nR];
+  check('漂移刷新后正文已换：上下文刷新为 V2 正文', !!reqD && reqD.messages.some((m) => m.role === 'system' && (m.text || '').includes('PAGE-A-V2-MARKER')), 'system=' + (reqD?.messages.find((m) => m.role === 'system')?.text || '').slice(0, 80));
+  await tabAction(`${BASE}/a?v=2`, 'om:close-card');
+  cardD2.close();
 } catch (e) {
   check('执行异常', false, e.stack || e.message);
 } finally {

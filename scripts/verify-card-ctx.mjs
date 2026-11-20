@@ -44,9 +44,16 @@ try {
   const swDo = async (expr) => { const s = await browser.sw(); const r = await s.evaluate(expr); s.close(); return r; };
   const tabAction = (urlPrefix, type) => swDo(`chrome.tabs.query({}).then((ts) => { const t = ts.find((x) => (x.url || '').startsWith(${JSON.stringify(urlPrefix)})); return chrome.tabs.sendMessage(t.id, { type: ${JSON.stringify(type)} }); }).then(() => 'ok')`);
   const seenFrames = new Set();
+  // 收起（om:close-card）现在只隐藏不销毁：重开同一标签页的卡连回原 iframe（无新 target）。
+  // 优先等新 target（新标签页开卡），4 秒没有再按宿主页参数匹配已有 target（收起复活）
   const openCard = async (urlPrefix) => {
+    const before = new Set((await browser.targets()).map((x) => x.id));
     await tabAction(urlPrefix, 'om:open-card');
-    const t = await waitFor(async () => (await browser.targets()).find((x) => x.type === 'iframe' && x.url.includes('/src/sidepanel/sidepanel.html') && !seenFrames.has(x.id)), { timeout: 12000 });
+    const cardT = (ts) => ts.filter((x) => x.type === 'iframe' && x.url.includes('/src/sidepanel/sidepanel.html'));
+    let t = await waitFor(async () => cardT(await browser.targets()).find((x) => !before.has(x.id)), { timeout: 4000 }).catch(() => null);
+    if (!t) {
+      t = await waitFor(async () => cardT(await browser.targets()).find((x) => { try { return decodeURIComponent(x.url).includes(urlPrefix); } catch { return false; } }), { timeout: 12000 });
+    }
     seenFrames.add(t.id);
     const s = await connect(t.webSocketDebuggerUrl);
     await s.send('Runtime.enable');

@@ -125,7 +125,19 @@ try {
   const pc2 = await pillCenter();
   await tab.click(pc2.x, pc2.y);
   await sleep(500);
-  check('再点胶囊聊天卡收起', !await E(`document.getElementById('om-card-host')`));
+  // 收起 = 隐藏不销毁（任务照跑）：宿主还在，display 置 none；再点原样复活
+  check('再点胶囊聊天卡收起（隐藏不销毁）', await E(`document.getElementById('om-card-host')?.style.display === 'none'`));
+  await hoverOpen();
+  const pc3 = await pillCenter();
+  await tab.click(pc3.x, pc3.y);
+  await sleep(800);
+  check('再点胶囊聊天卡复活（原 iframe 展示）', await E(`document.getElementById('om-card-host')?.style.display === ''`));
+  // 还原现场：把卡再收起（隐藏态），后续拖动 / clamp 步骤回到无卡几何
+  await hoverOpen();
+  const pc4 = await pillCenter();
+  await tab.click(pc4.x, pc4.y);
+  await sleep(500);
+  check('现场还原：卡回到隐藏态', await E(`document.getElementById('om-card-host')?.style.display === 'none'`));
   await tab.mouse('mouseMoved', pc2.x - 200, pc2.y); // 移开收起，还原球态
   await sleep(500);
 

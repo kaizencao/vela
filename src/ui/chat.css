@@ -553,6 +553,8 @@ details.om-agent-step { display: block; }
   white-space: pre-wrap;
 }
 .om-stopped { margin-top: 4px; font-size: var(--om-fs-xs); color: var(--om-text-2); }
+/* 超长消息渲染截断提示（renderBodyInto）：只影响显示，全文仍发送 / 可复制导出 */
+.om-clamp-note { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--om-border); font-size: var(--om-fs-xs); color: var(--om-text-2); }
 
 /* ===================== 跳到最新 ===================== */
 /* 用户上滚离开底部时浮现于消息区下缘（composer 上方），点按回底部并恢复自动跟随 */

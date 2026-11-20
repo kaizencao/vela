@@ -105,13 +105,18 @@ export async function createChatView() {
     // 无条件优先会让 A 页的会话跟到 B 页——正是页绑定要拦的串会话；随后 reconcileHostCtx
     // 还会按绑定把它拽走换新建，卡闪空）。记忆只在本页内生效（同页多会话续聊），或会话无绑定
     const w = conversations.find((c) => c.id === wantedConv);
-    if (w && (!cardPageKey || !w.pageKey || w.pageKey === cardPageKey)) currentId = w.id;
+    if (w && (!cardPageKey || !w.pageKey || pageKey(w.pageKey) === cardPageKey)) currentId = w.id;
   }
-  if (!currentId && cardPageKey) currentId = conversations.find((c) => c.pageKey === cardPageKey
+  if (!currentId && cardPageKey) currentId = conversations.find((c) => pageKey(c.pageKey) === cardPageKey
     || (c.pageCtx && pageKey(c.pageCtx.url) === cardPageKey))?.id ?? '';
   if (!currentId && cardPageKey) cardNew = { pageKey: cardPageKey, title: (cardParams.get('pt') || '').trim() || '新对话' };
   if (!currentId && !cardNew) currentId = conversations.slice().sort((a, b) => lastActive(b) - lastActive(a))[0]?.id ?? '';
   let streaming = null; // {kind:'llm', abort, flushNow, persistStopped} | {kind:'agent', sessionId}
+  // 任务状态上报宿主页浮窗：卡收起（隐藏）后任务照跑，浮窗球/胶囊亮角标提醒「在跑 / 干完了」。
+  // 只在卡形态（iframe 里有 parent）发，侧边栏 / 聊天页没有浮窗可挂
+  const notifyHostTask = (state) => {
+    try { if (window.parent !== window) parent.postMessage({ type: 'om:card-task', state }, '*'); } catch { /* 跨源受限时忽略 */ }
+  };
   // agent 轮运行中用户仍可发消息：入队（userItem 已落盘，关页不丢），本轮结束自动逐条发出
   const agentQueue = [];
   let translating = false;
@@ -924,6 +929,24 @@ export async function createChatView() {
     return row;
   }
 
+  // ---- 渲染截断（卡死恢复的兜底）----
+  // 巨长消息（多 MB 的提问 / 回答）每次渲染都要全量软换行排版，切换回会话就卡死整框——
+  // 输入上限挡不住存量数据，这里按显示层截断：只渲染前 RENDER_MAX_CHARS 字符 + 折叠提示，
+  // 存储与发送 / 复制 / 导出仍用全文，任何来源的超长消息都不再拖垮渲染
+  const RENDER_MAX_CHARS = 30000;
+  function renderBodyInto(el, text, plain = false) {
+    if (text && text.length > RENDER_MAX_CHARS) {
+      const head = text.slice(0, RENDER_MAX_CHARS);
+      if (plain) el.textContent = head; else el.innerHTML = renderMarkdown(head);
+      const note = document.createElement('div');
+      note.className = 'om-clamp-note';
+      note.textContent = `内容过长（共 ${text.length.toLocaleString()} 字符），超出部分已折叠不显示；发送 / 复制 / 导出仍用全文`;
+      el.appendChild(note);
+      return;
+    }
+    if (plain) el.textContent = text; else el.innerHTML = renderMarkdown(text);
+  }
+
   function messageEl(item) {
     const wrap = document.createElement('div');
     wrap.className = `om-msg om-msg-${item.type}`;
@@ -943,14 +966,14 @@ export async function createChatView() {
         sum.textContent = `网页正文 · ${item.meta.chars || item.content.length} 字`;
         const src = document.createElement('div');
         src.className = 'om-agent-thought-body';
-        src.textContent = item.content;
+        renderBodyInto(src, item.content, true);
         det.append(sum, src);
         wrap.append(cap, det);
         return wrap;
       }
       const body = document.createElement('div');
       body.className = 'om-body';
-      body.textContent = item.content;
+      renderBodyInto(body, item.content, true);
       wrap.appendChild(body);
       return wrap;
     }
@@ -991,7 +1014,7 @@ export async function createChatView() {
     }
     const body = document.createElement('div');
     body.className = 'om-body markdown';
-    body.innerHTML = renderMarkdown(item.content);
+    renderBodyInto(body, item.content);
     wrap.appendChild(body);
     if (item.error) {
       const err = document.createElement('div');
@@ -1278,7 +1301,7 @@ export async function createChatView() {
       }
       const el = bodyEl();
       if (el) {
-        el.innerHTML = renderMarkdown(localContent);
+        renderBodyInto(el, localContent);
         if (scrollPinned) R.messages.scrollTop = R.messages.scrollHeight;
       }
     };
@@ -1295,6 +1318,7 @@ export async function createChatView() {
         await persistNow(true);
       },
     };
+    notifyHostTask('running');
     // 发送按钮切成「停止」：流式期间点它是停止本轮（旧版漏了这句，按钮仍显示「发送」，
     // 用户以为在发新消息，实际把正在生成的回答停掉了）
     setStreamingUi(true);
@@ -1391,6 +1415,7 @@ export async function createChatView() {
     answerWrap?.classList.remove('om-streaming');
     flush();
     streaming = null;
+    notifyHostTask('done');
     setStreamingUi(false);
     setBusyUi();
     // 收尾重载是存储兜底。但重载 await 期间可能已有新发送把提问推进内存版（按钮一恢复
@@ -1461,7 +1486,7 @@ export async function createChatView() {
       const now = Date.now();
       if (state.stopReason || now - agentBodyAt >= BODY_RENDER_MS) {
         const bodyEl = wrap.querySelector('.om-body');
-        if (bodyEl) bodyEl.innerHTML = renderMarkdown(state.content);
+        if (bodyEl) renderBodyInto(bodyEl, state.content);
         agentBodyAt = now;
         agentPending.content = false;
         touched = true;
@@ -1703,6 +1728,7 @@ export async function createChatView() {
     };
 
     streaming = { kind: 'agent' };
+    notifyHostTask('running');
     setStreamingUi(true);
     const answerWrap = R.column.querySelector(`[data-item-id='${answer.id}']`);
     answerWrap?.classList.add('om-streaming');
@@ -1815,10 +1841,11 @@ export async function createChatView() {
       }),
     );
     await writeChain;
-    bodyEl.innerHTML = renderMarkdown(agentTurn?.state.content || '');
+    renderBodyInto(bodyEl, agentTurn?.state.content || '');
     clearTimeout(turnLossTimer);
     agentTurn = null;
     streaming = null;
+    notifyHostTask('done');
     setStreamingUi(false);
     setBusyUi();
     // 与 LLM 轮收尾同款守卫：重载 await 期间有新发送（或排队消息）推进内存版时保持内存版，
@@ -1921,6 +1948,7 @@ export async function createChatView() {
     if (streaming && streaming.kind !== 'agent') {
       const s = streaming;
       streaming = null;
+      notifyHostTask('done'); // 手动停止也是轮收尾，角标状态一致
       setStreamingUi(false);
       await s.persistStopped();
       conversations = await loadConversations();
@@ -2971,7 +2999,12 @@ export async function createChatView() {
   let hostResolve = null;
   const hostReady = new Promise((res) => { hostResolve = res; setTimeout(res, 800); }); // 宿主没回应也不能卡住启动
   function pageKey(u) {
-    try { const x = new URL(u); return x.origin + x.pathname + x.search; } catch { return String(u || ''); } // 去掉 #hash：锚点跳转不算换页
+    // 只取 origin + pathname：#hash 与 query 都不算换页。query 参与身份曾导致「收起卡片 /
+    // 刷新页面后新建会话」——站点翻页 / 筛选 / 刷新时加跟踪参数都会让键漂走，绑定的会话
+    // 找不回来。正文变化由 om:card-ctx 重发解决（widget 侧的 pageKeyNow 保留 query，专门
+    // 负责发现参数变化并刷新上下文），这里只管「是哪个页面」。老数据里的 pageKey 带 query，
+    // 比对前统一过一遍本函数归一（零迁移）
+    try { const x = new URL(u); return x.origin + x.pathname; } catch { return String(u || ''); }
   }
   let reconcileTries = 0;
   async function reconcileHostCtx() {
@@ -2986,12 +3019,21 @@ export async function createChatView() {
     if (!conv) return;
     const hostK = pageKey(hostUrl);
     // 页绑定优先用持久 pageKey 字段（建会话 / 绑页时写入），老会话回退按 pageCtx.url
-    // 推导（零迁移）；两者都没有 = 从没绑过页（侧边栏会话），不悄悄换绑
-    const bound = conv.pageKey || (conv.pageCtx ? pageKey(conv.pageCtx.url) : '');
+    // 推导（零迁移）；两者都没有 = 从没绑过页（侧边栏会话），不悄悄换绑。
+    // 存量 pageKey 可能是带 query 的旧格式，归一后再比对
+    const bound = pageKey(conv.pageKey) || (conv.pageCtx ? pageKey(conv.pageCtx.url) : '');
     if (bound === hostK) {
       // 老会话按 pageCtx 推导命中本页：补写 pageKey 字段（写一次即定格，之后按字段比对）
       if (!conv.pageKey) { conv.pageKey = hostK; await saveConversations(conversations); }
       if (!conv.pageCtx && attachPageCtx(conv)) { conv.pageKey = hostK; await saveConversations(conversations); renderCtxRow(); }
+      // 同页正文漂移（翻页 / 筛选换 query、动态内容重渲染）：网页上下文跟着刷新，
+      // 下轮提问拿当前视图的正文；agent 的「已注入一次」标记作废，下轮重注入
+      else if (conv.pageCtx && cardCtx && (conv.pageCtx.text !== cardCtx.text || conv.pageCtx.title !== cardCtx.title)) {
+        conv.pageCtx = cardCtx;
+        delete conv.pageCtxSent;
+        await saveConversations(conversations);
+        renderCtxRow();
+      }
       return;
     }
     if (!bound) {
@@ -3186,7 +3228,7 @@ export async function createChatView() {
       raf = 0;
       const el = bodyEl();
       if (el) {
-        el.innerHTML = renderMarkdown(localContent);
+        renderBodyInto(el, localContent);
         if (scrollPinned) R.messages.scrollTop = R.messages.scrollHeight;
       }
     };
@@ -3194,6 +3236,7 @@ export async function createChatView() {
 
     const abort = new AbortController();
     streaming = { abort, flushNow: flush, persistStopped: async () => { abort.abort(); await persistNow(true); } };
+    notifyHostTask('running');
     setStreamingUi(true);
     const answerWrap = R.column.querySelector(`[data-item-id='${answer.id}']`);
     answerWrap?.classList.add('om-streaming');
@@ -3290,6 +3333,7 @@ export async function createChatView() {
     answerWrap?.classList.remove('om-streaming');
     flush();
     streaming = null;
+    notifyHostTask('done');
     setStreamingUi(false);
     setBusyUi();
     conversations = await loadConversations();
@@ -3408,11 +3452,34 @@ export async function createChatView() {
   }
 
   // ---- 输入框 ----
+  // 输入上限：textarea 软换行重排是全量 O(n)，几十万字符起每敲一键就要全量重排几十上百毫秒，
+  // 多 MB 直接按秒卡死整框；LLM 上下文也装不下这种量级，超长文本应走知识库 / 图片附件。
+  // 超限即截断并提示（实测 400KB 每键 ~45ms、1MB ~145ms）。IME 组合输入期间不截，
+  // 收词后下一次 input 收口，防打断候选词
+  const INPUT_MAX_CHARS = 100000;
+  let inputOverToldAt = 0;
   function autoGrow() {
-    R.input.style.height = 'auto';
+    const v = R.input.value;
+    let nl = 0;
+    for (let i = 0; i < v.length; i++) if (v.charCodeAt(i) === 10) nl++;
+    // 内容「长高了」才走免 auto 的快路径：定高下 scrollHeight 只能给出不小于当前高的内容高。
+    // 字符与换行数都不小于上一次才算长高（选区替换可能字数变多行数变少），否则 auto 态全量重量
+    const grew = v.length >= (autoGrow.prevLen ?? Infinity) && nl >= (autoGrow.prevNl ?? Infinity);
+    if (!grew) R.input.style.height = 'auto';
     R.input.style.height = Math.min(R.input.scrollHeight, 160) + 'px';
+    autoGrow.prevLen = v.length;
+    autoGrow.prevNl = nl;
   }
-  R.input.addEventListener('input', autoGrow);
+  R.input.addEventListener('input', (e) => {
+    if (!e.isComposing && R.input.value.length > INPUT_MAX_CHARS) {
+      R.input.value = R.input.value.slice(0, INPUT_MAX_CHARS);
+      if (Date.now() - inputOverToldAt > 3000) {
+        inputOverToldAt = Date.now();
+        showToast(R.toast, `输入超长，已截断到 ${INPUT_MAX_CHARS / 10000} 万字符；继续贴大段内容请用知识库或附件`, 'error');
+      }
+    }
+    autoGrow();
+  });
   R.input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();

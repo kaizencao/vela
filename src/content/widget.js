@@ -136,25 +136,65 @@
   const CARD_WIDTH = 'min(420px, calc(100vw - 104px))';
   let pillEl = null;
 
-  function chatCardOpen() {
+  // 卡是否活着（含收起后的隐藏态）：收起 = display:none 藏起来，iframe 不销毁——
+  // 里面正在跑的流式任务（LLM 流式 / agent 轮）继续执行；销毁会触发卡片 pagehide
+  // 发取消 / 中止，把任务杀掉。真正销毁只发生在浮窗 × 隐藏、宿主页整页离开、扩展重载
+  function chatCardAlive() {
     return document.getElementById(CARD_ID) !== null;
+  }
+
+  // 卡是否可见（展开态）：胶囊开关、浮窗让位、展开列常驻等 UI 状态都用它
+  function chatCardOpen() {
+    const host = document.getElementById(CARD_ID);
+    return !!host && host.style.display !== 'none';
+  }
+
+  // 卡片任务角标：收起 ≠ 销毁之后，卡隐藏期间任务照跑——球与胶囊亮小标记让用户知道
+  // 「后台有活 / 干完了」，不然收起像把任务吞了。状态由卡片 iframe 经 om:card-task 上报
+  let cardTaskBadges = []; // [球上的角标, 胶囊上的角标]，build() 里填充
+  let cardTaskState = '';  // '' | 'running'（绿点呼吸） | 'done'（橙点常亮，仅卡收起时亮出）
+  function syncTaskBadge() {
+    const showRun = cardTaskState === 'running';
+    const showDone = cardTaskState === 'done' && !chatCardOpen();
+    for (const b of cardTaskBadges) {
+      b.classList.toggle('run', showRun);
+      b.classList.toggle('done', showDone);
+    }
   }
 
   // 卡片贴右满高打开时浮窗列左移让位，收卡后回到右缘
   function syncWidgetOffset() {
     const host = window.__omWidget?.host;
     if (!host) return;
-    host.style.right = document.getElementById(CARD_ID) ? `calc(${CARD_WIDTH} + 12px)` : '10px';
+    host.style.right = chatCardOpen() ? `calc(${CARD_WIDTH} + 12px)` : '10px';
   }
 
-  function closeChatCard() {
-    document.getElementById(CARD_ID)?.remove();
+  function closeChatCard(destroy = false) {
+    // 藏而不删（style.display 与快照的隐藏/还原逻辑同机制，互相兼容）；任务照跑。
+    // destroy=true 才真销毁（触发卡片 pagehide 取消任务）：浮窗 × 与「暂停本页」用——
+    // 用户明确让 vela 从本页退场 / 给自动化让路，隐藏着跑的任务会干扰自动化
+    const host = document.getElementById(CARD_ID);
+    if (!host) return;
+    if (destroy) {
+      host.remove();
+      // 卡已销毁（任务随之取消）：角标状态跟着清，别留一颗指向不存在任务的橙点
+      if (cardTaskState) { cardTaskState = ''; syncTaskBadge(); }
+    } else host.style.display = 'none';
     pillEl?.classList.remove('on');
     syncWidgetOffset();
   }
 
   function openChatCard() {
-    if (chatCardOpen()) return;
+    // 收起态复活：iframe 还活着（任务可能还在跑），原样亮出来即可，不重建
+    const existing = document.getElementById(CARD_ID);
+    if (existing) {
+      existing.style.display = '';
+      pillEl?.classList.add('on');
+      syncWidgetOffset();
+      // 展开即「已查看」：完成橙点清掉（运行绿点保留——任务可能还在跑）
+      if (cardTaskState === 'done') { cardTaskState = ''; syncTaskBadge(); }
+      return;
+    }
     let url;
     try {
       url = chrome.runtime.getURL('src/sidepanel/sidepanel.html');
@@ -171,6 +211,8 @@
       + `${sep}page=${encodeURIComponent(location.href)}&pt=${encodeURIComponent(String(document.title || '').trim().slice(0, 60))}`;
     const host = document.createElement('div');
     host.id = CARD_ID;
+    cardTaskState = ''; // 新卡从空白任务态开始（旧卡销毁残留的状态不复用）
+    syncTaskBadge();
     // 贴右满高（对齐原生侧边栏形态）：浮窗列同步左移让位
     host.style.cssText = `all:initial;position:fixed;right:0;top:0;bottom:0;width:${CARD_WIDTH};z-index:2147483644;`;
     const croot = host.attachShadow({ mode: 'open' });
@@ -742,6 +784,7 @@
         .stack { display: none; flex-direction: column; align-items: center; gap: 8px; }
         .stack.open { display: flex; animation: om-pop-in .15s ease; }
         .om-ball {
+          position: relative;
           width: 40px; height: 40px; border-radius: 50%; border: none; cursor: grab;
           background: #6841ea; color: #fff; display: flex; align-items: center; justify-content: center;
           box-shadow: 0 4px 14px rgba(68,44,180,.36); padding: 0;
@@ -866,6 +909,17 @@
           text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.3);
         }
         .pill.on { background: #5a35d0; box-shadow: 0 6px 18px rgba(68,44,180,.55); }
+        /* 卡片任务角标（syncTaskBadge）：任务在跑（绿点呼吸）/ 完成未看（橙点常亮）。
+           球挂右上角；胶囊挂右下角——右上是「暂停本页」钮、左上是「隐藏浮窗」钮，别摞一起 */
+        .om-task-badge {
+          position: absolute; right: -3px; bottom: -3px; width: 12px; height: 12px;
+          border-radius: 50%; pointer-events: none; display: none;
+          box-shadow: 0 1px 4px rgba(0,0,0,.3);
+        }
+        .om-ball .om-task-badge { top: -2px; bottom: auto; right: -2px; width: 11px; height: 11px; }
+        .om-task-badge.run { display: block; background: #3ddc84; animation: om-task-pulse 1.2s ease infinite; }
+        .om-task-badge.done { display: block; background: #ffb020; }
+        @keyframes om-task-pulse { 50% { transform: scale(1.4); opacity: .7; } }
       </style>
       <button class="om-ball" title="Vela AI 助手（悬停展开菜单，按住可上下拖动）"></button>
       <div class="stack">
@@ -901,6 +955,13 @@
     root.querySelector('.pause').appendChild(svg('pause', 9));
     root.querySelector('.om-ball').appendChild(svg('logo', 20));
     pillEl = root.querySelector('.pill');
+    // 任务角标（见 syncTaskBadge）：球与胶囊各一颗，卡片经 om:card-task 驱动亮灭
+    cardTaskBadges = [root.querySelector('.om-ball'), pillEl].map((el) => {
+      const b = document.createElement('span');
+      b.className = 'om-task-badge';
+      el.appendChild(b);
+      return b;
+    });
 
     // 悬浮球 ↔ 动作列互换：注入后默认收起（球 40×40，占位从整列缩到一颗球）。
     // 悬停 180ms 展开（略过快速划过），移开 300ms 收起；点球立即展开（触屏兜底）。
@@ -1108,7 +1169,7 @@
     root.querySelector('.dismiss').addEventListener('click', (e) => {
       e.stopPropagation();
       host.remove();
-      closeChatCard();
+      closeChatCard(true);
       closeHoverPop();
     });
     // 暂停本页：为浏览器自动化让路。除本浮窗外，同 world 的划词工具条/代码/高亮钮、
@@ -1123,7 +1184,7 @@
     const doPause = () => {
       try { sessionStorage.setItem(PAUSE_KEY, JSON.stringify({ u: pageKeyNow() })); } catch { /* 存不了也收：仅本次文档生效 */ }
       host.remove();
-      closeChatCard();
+      closeChatCard(true);
       closeHoverPop();
       document.getElementById(HOVER_BTN_ID)?.remove();
       document.getElementById('om-media-pop')?.remove();
@@ -1171,7 +1232,7 @@
       let alive = false;
       try { alive = !!chrome.runtime?.id; } catch { /* 上下文已失效 */ }
       if (!alive) { clearInterval(ctxPoll); clearTimeout(ctxTimer); return; } // 扩展重载后旧实例自行退场
-      if (!chatCardOpen()) { ctxPageKey = pageKey(); return; }
+      if (!chatCardAlive()) { ctxPageKey = pageKey(); return; }
       const k = pageKey();
       if (k === ctxPageKey) return;
       ctxPageKey = k;
@@ -1211,6 +1272,15 @@
       if (d?.type === 'om:card-conv') {
         if (ev.source === cardFrame()) {
           try { sessionStorage.setItem('om-card-conv', String(d.convId || '')); } catch { /* 页面禁用存储时忽略 */ }
+        }
+        return;
+      }
+      // 聊天卡上报任务状态（running / done）：驱动球与胶囊的任务角标。
+      // 卡开着时收「done」= 用户正看着结果，不亮橙点；收起后才亮
+      if (d?.type === 'om:card-task') {
+        if (ev.source === cardFrame() && (d.state === 'running' || d.state === 'done')) {
+          cardTaskState = d.state === 'done' && chatCardOpen() ? '' : d.state;
+          syncTaskBadge();
         }
         return;
       }
